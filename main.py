@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import html
+import io
 import os
 import random
 import re
@@ -21,6 +22,7 @@ from aiogram.types import (
     PreCheckoutQuery,
     BotCommand,
     FSInputFile,
+    BufferedInputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -29,7 +31,7 @@ from openai import AsyncOpenAI
 # ================= НАСТРОЙКИ ДЛЯ ХОСТИНГА (ENV) =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 UNLOCK_API_KEY = os.getenv("UNLOCK_API_KEY", "").strip()
-UNLOCK_BASE_URL = os.getenv("UNLOCK_BASE_URL", "https://unlockapi.space/v1").strip()
+UNLOCK_BASE_URL = os.getenv("UNLOCK_BASE_URL", "https" + "://" + "unlockapi.space/v1").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN! Добавь её в настройках хостинга.")
@@ -39,17 +41,32 @@ if not UNLOCK_API_KEY:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1991878700"))
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AetherNeural")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/AetherNeural")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 
-DB_PATH = os.getenv("DB_PATH", "users.db")
+DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
+IMAGE_GEN_COST = 2  # Сколько запросов списывать за 1 сгенерированную картинку
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 USERS_PER_PAGE = 8
 
+IMAGE_MODELS = [
+    m.strip()
+    for m in os.getenv("IMAGE_MODELS", "flux,gpt-image-1,dall-e-3").split(",")
+    if m.strip()
+]
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
+
 DISCOUNT_DELAY_SECONDS = 2 * 3600      # Через 2 часа после первого сообщения
 DISCOUNT_DURATION_SECONDS = 36 * 3600  # Скидка действует 36 часов
+
+TEXT_FILE_EXTS = {
+    ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".htm", ".css",
+    ".json", ".csv", ".md", ".xml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".log", ".sql", ".sh", ".bat", ".cpp", ".c", ".h", ".hpp", ".cs", ".java",
+    ".kt", ".go", ".rs", ".php", ".rb", ".lua", ".r", ".swift", ".env",
+}
 
 FALLBACK_MODELS = [
     "gpt-6-luna",
@@ -138,7 +155,7 @@ SYSTEM_PROMPT = (
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
-    timeout=45.0,
+    timeout=60.0,
     max_retries=0,
 )
 router = Router()
@@ -219,7 +236,7 @@ def get_product_price(product: dict, discount_active: bool) -> int:
     return base
 
 
-# ================= БАЗА ДАННЫХ И TELEGRAM-БЭКАПЫ =================
+# ================= БАЗА ДАННЫХ =================
 async def init_db():
     db_dir = os.path.dirname(os.path.abspath(DB_PATH))
     if db_dir:
@@ -340,7 +357,7 @@ async def init_db():
         await db.commit()
 
 
-async def send_db_backup(bot: Bot, reason: str = "Автобэкап"):
+async def send_db_backup(bot: Bot, reason: str = "Ручной бэкап"):
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -349,26 +366,18 @@ async def send_db_backup(bot: Bot, reason: str = "Автобэкап"):
                 async with db.execute("SELECT COUNT(*) FROM users WHERE pro_until > ?", (time.time(),)) as cur:
                     pro_u = (await cur.fetchone())[0]
 
-            file = FSInputFile(DB_PATH, filename="users.db")
+            file = FSInputFile(DB_PATH, filename=os.path.basename(DB_PATH))
             await bot.send_document(
                 ADMIN_ID,
                 document=file,
                 caption=(
                     f"💾 <b>{reason} базы данных</b> ({datetime.now().strftime('%d.%m.%Y %H:%M')})\n"
-                    f"👥 Пользователей: <b>{total_u}</b> | 👑 PRO: <b>{pro_u}</b>\n\n"
-                    f"<i>Если после перезапуска хостинга база сбросится — просто перешли этот файл мне в личку.</i>"
+                    f"👥 Пользователей: <b>{total_u}</b> | 👑 PRO: <b>{pro_u}</b>"
                 ),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             print(f"Ошибка отправки бэкапа: {e}")
-
-
-async def auto_backup_watcher(bot: Bot):
-    await asyncio.sleep(120)
-    while True:
-        await send_db_backup(bot, reason="Автобэкап")
-        await asyncio.sleep(3 * 3600)
 
 
 async def get_setting(key: str, default: str = "") -> str:
@@ -441,13 +450,14 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
             clean_uname = (username or "")[:40]
             await db.execute(
                 """
-                INSERT INTO users (user_id, full_name, username, last_reset, referred_by, ref_rewarded, joined_at, first_seen_at)
+                INSERT OR IGNORE INTO users (user_id, full_name, username, last_reset, referred_by, ref_rewarded, joined_at, first_seen_at)
                 VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (user_id, clean_name, clean_uname, today_str, valid_ref, now, now),
             )
             await db.commit()
-            return await get_user(user_id)
+            async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur2:
+                row = await cur2.fetchone()
 
         user = dict(row)
         updates = []
@@ -775,14 +785,17 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="⚡ Grok", callback_data="cat:grok"),
+            InlineKeyboardButton(text="🎨 Генерация фото", callback_data="gen_image"),
+        ],
+        [
             InlineKeyboardButton(text="⭐ Подписка / Пакеты", callback_data="shop"),
-        ],
-        [
             InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-            InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
         ],
         [
+            InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
             InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
+        ],
+        [
             InlineKeyboardButton(text="🧹 Сброс чата", callback_data="clear_chat"),
         ],
     ]
@@ -866,7 +879,7 @@ async def admin_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
-            [InlineKeyboardButton(text="💾 Скачать бэкап базы (users.db)", callback_data="adm_backup_now")],
+            [InlineKeyboardButton(text="💾 Скачать бэкап базы вручную", callback_data="adm_backup_now")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
             [InlineKeyboardButton(text=f"⚙️ Общий движок (для юзеров): {engine}", callback_data="adm_set_engine")],
@@ -884,21 +897,202 @@ def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     )
 
 
-# ================= ВОССТАНОВЛЕНИЕ И РУЧНОЙ БЭКАП БАЗЫ ДАННЫХ =================
-@router.callback_query(F.data == "adm_backup_now")
-async def cb_adm_backup_now(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != ADMIN_ID:
+# ================= ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ =================
+@router.callback_query(F.data == "gen_image")
+async def cb_gen_image(call: CallbackQuery, bot: Bot):
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
         return
-    await call.answer("💾 Формирую файл базы...")
-    await send_db_backup(bot, reason="Ручной бэкап")
+    USER_INPUT_STATE[call.from_user.id] = "await_image_prompt"
+    await call.message.edit_text(
+        "🎨 <b>Генерация изображений</b>\n\n"
+        "Опиши текстом, что нужно нарисовать (например: <i>«Киберпанк-город ночью под неоновым дождём, детализация 4k»</i>).\n\n"
+        f"⚡ Стоимость: <b>{IMAGE_GEN_COST} запроса</b> (по подписке PRO — безлимит).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.message(Command("img"))
+async def cmd_img(message: Message, bot: Bot):
+    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, message.from_user.id, message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        USER_INPUT_STATE[message.from_user.id] = "await_image_prompt"
+        await message.answer(
+            "🎨 Отправь описание картинки одним сообщением (стоимость: <b>2 запроса</b>):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await run_image_generation(message, parts[1].strip())
+
+
+async def generate_image_bytes(prompt: str) -> bytes:
+    last_error = None
+    for model_name in IMAGE_MODELS:
+        try:
+            resp = await ai_client.images.generate(
+                model=model_name,
+                prompt=prompt,
+                n=1,
+                size="1024x1024",
+            )
+            item = resp.data[0]
+            if getattr(item, "b64_json", None):
+                return base64.b64decode(item.b64_json)
+            if getattr(item, "url", None):
+                import urllib.request
+                loop = asyncio.get_running_loop()
+                data = await loop.run_in_executor(
+                    None, lambda u=item.url: urllib.request.urlopen(u, timeout=30).read()
+                )
+                if data:
+                    return data
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise last_error or RuntimeError("Модели генерации изображений временно недоступны")
+
+
+async def run_image_generation(message: Message, prompt: str):
+    user_id = message.from_user.id
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=IMAGE_GEN_COST)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            f"⏳ Для генерации картинки нужно <b>{IMAGE_GEN_COST} запроса</b>, но твой баланс исчерпан.\n"
+            "Пригласи друга (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    wait_msg = await message.answer("🎨 <i>Рисую изображение, подожди 10–20 секунд...</i>", parse_mode=ParseMode.HTML)
+    try:
+        img_bytes = await generate_image_bytes(prompt)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
+                (IMAGE_GEN_COST, user_id),
+            )
+            await db.commit()
+
+        await wait_msg.delete()
+        photo_file = BufferedInputFile(img_bytes, filename="generated.png")
+        await message.answer_photo(
+            photo=photo_file,
+            caption=f"🎨 <b>Готово!</b>\n<i>Запрос: {html.escape(prompt[:200])}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Не удалось сгенерировать картинку:</b>\n<code>{str(e)[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ================= ГОЛОСОВЫЕ СООБЩЕНИЯ (AUDIO -> WHISPER -> НЕЙРОСЕТЬ) =================
+@router.message(F.voice)
+async def handle_voice(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    model_id = user["selected_model"]
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+    if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
+        disc = has_active_discount(user)
+        await message.answer(
+            "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
+            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    wait_msg = await message.answer("🎙 <i>Слушаю голосовое и готовлю ответ...</i>", parse_mode=ParseMode.HTML)
+    try:
+        file_info = await bot.get_file(message.voice.file_id)
+        downloaded = await bot.download_file(file_info.file_path)
+        audio_bio = io.BytesIO(downloaded.read())
+        audio_bio.name = "voice.ogg"
+
+        transcript = await ai_client.audio.transcriptions.create(
+            model=WHISPER_MODEL,
+            file=audio_bio,
+        )
+        recognized_text = (getattr(transcript, "text", None) or "").strip()
+        if not recognized_text:
+            raise RuntimeError("Не удалось разобрать слова в голосовом сообщении")
+
+        history = await get_history(user_id)
+        answer_text = await generate_text_response(
+            user_id=user_id,
+            selected_model=model_id,
+            history=history,
+            user_text=recognized_text,
+        )
+
+        await add_history(user_id, "user", recognized_text)
+        await add_history(user_id, "assistant", answer_text)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+        await wait_msg.delete()
+        full_reply = f"🗣 Вы сказали: {recognized_text}\n\n{answer_text}"
+        await send_formatted_answer(message, full_reply)
+
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Не удалось обработать голосовое:</b>\n<code>{str(e)[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ================= ДОКУМЕНТЫ: ТЕКСТОВЫЕ ФАЙЛЫ + ВОССТАНОВЛЕНИЕ БАЗЫ =================
+def decode_text_bytes(raw: bytes) -> str:
+    for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 @router.message(F.document)
-async def handle_db_upload(message: Message, bot: Bot):
-    if message.from_user.id != ADMIN_ID:
-        return
+async def handle_document(message: Message, bot: Bot):
+    user_id = message.from_user.id
     document = message.document
-    if document.file_name and document.file_name.endswith(".db"):
+    fname = document.file_name or ""
+    ext = os.path.splitext(fname.lower())[1]
+
+    # 1. Восстановление базы данных администратором
+    if user_id == ADMIN_ID and ext in (".db", ".sqlite", ".sqlite3"):
         try:
             file_info = await bot.get_file(document.file_id)
             bytes_file = await bot.download_file(file_info.file_path)
@@ -918,6 +1112,92 @@ async def handle_db_upload(message: Message, bot: Bot):
             )
         except Exception as e:
             await message.answer(f"❌ <b>Ошибка восстановления:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    # 2. Решение задач по текстовым файлам и файлам с кодом
+    if ext not in TEXT_FILE_EXTS:
+        await message.answer(
+            "⚠️ Поддерживаются текстовые файлы и исходный код (<code>.txt</code>, <code>.py</code>, <code>.js</code>, <code>.html</code>, <code>.csv</code>, <code>.json</code>, <code>.md</code>, <code>.sql</code> и др.).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if document.file_size and document.file_size > 2 * 1024 * 1024:
+        await message.answer("⚠️ Файл слишком большой (максимум 2 МБ).")
+        return
+
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    model_id = user["selected_model"]
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+    if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
+        disc = has_active_discount(user)
+        await message.answer(
+            "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
+            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    wait_msg = await message.answer(f"📄 <i>Читаю файл {html.escape(fname)} и решаю...</i>", parse_mode=ParseMode.HTML)
+    try:
+        file_info = await bot.get_file(document.file_id)
+        downloaded = await bot.download_file(file_info.file_path)
+        file_text = decode_text_bytes(downloaded.read()).strip()
+
+        if not file_text:
+            raise RuntimeError("Файл пустой")
+
+        if len(file_text) > 18000:
+            file_text = file_text[:18000] + "\n\n[...текст файла обрезан до 18 000 символов...]"
+
+        task_caption = (message.caption or "").strip() or "Разбери содержимое этого файла и реши все задания или исправь ошибки."
+        combined_prompt = f"Задача от пользователя: {task_caption}\n\nСодержимое файла ({fname}):\n{file_text}"
+
+        history = await get_history(user_id)
+        answer_text = await generate_text_response(
+            user_id=user_id,
+            selected_model=model_id,
+            history=history,
+            user_text=combined_prompt,
+        )
+
+        await add_history(user_id, "user", f"[Файл {fname}]: {task_caption}\n{file_text[:1500]}")
+        await add_history(user_id, "assistant", answer_text)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+        await wait_msg.delete()
+        await send_formatted_answer(message, answer_text)
+
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Не удалось обработать файл:</b>\n<code>{str(e)[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ================= РУЧНОЙ БЭКАП БАЗЫ ДАННЫХ =================
+@router.callback_query(F.data == "adm_backup_now")
+async def cb_adm_backup_now(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer("💾 Формирую файл базы...")
+    await send_db_backup(bot, reason="Ручной бэкап")
 
 
 # ================= АДМИН: РАССЫЛКА ПО БАЗЕ =================
@@ -1194,7 +1474,6 @@ async def cb_adm_u_pro(call: CallbackQuery, bot: Bot):
         pass
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
 
 
 @router.callback_query(F.data.startswith("adm_u_pro_cust:"))
@@ -1228,7 +1507,6 @@ async def cb_adm_u_req(call: CallbackQuery, bot: Bot):
         pass
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    asyncio.create_task(send_db_backup(bot, reason=f"Начисление запросов ({target_id})"))
 
 
 @router.callback_query(F.data.startswith("adm_u_req_cust:"))
@@ -1905,7 +2183,6 @@ async def cmd_givepro(message: Message, bot: Bot):
         await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
     except Exception:
         pass
-    asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
 
 
 @router.message(Command("delpro"))
@@ -1946,7 +2223,7 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото (1 фото = 1 запрос).\n\n"
+        f"Я понимаю <b>текст, фото (1 фото = 1 запрос), голосовые сообщения и текстовые файлы/код</b>, а также умею <b>рисовать картинки</b>!\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
         f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
@@ -2164,7 +2441,7 @@ async def pre_checkout(query: PreCheckoutQuery):
 
 
 @router.message(F.successful_payment)
-async def successful_payment(message: Message, bot: Bot):
+async def successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload
     prod_key = payload.split(":", 1)[1]
     product = PRODUCTS[prod_key]
@@ -2206,8 +2483,6 @@ async def successful_payment(message: Message, bot: Bot):
                 f"Проверить остаток можно в /profile.",
                 parse_mode=ParseMode.HTML,
             )
-
-    asyncio.create_task(send_db_backup(bot, reason=f"Покупка ({message.from_user.id}, {paid_stars}⭐)"))
 
 
 # ================= ГЕНЕРАЦИЯ (ТЕКСТ И ПАКЕТ ФОТОГРАФИЙ) =================
@@ -2393,11 +2668,18 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+# ================= ОБРАБОТКА ТЕКСТА, КАРТИНОК, ПРОМОКОДОВ И АДМИН-ВВОДА =================
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
     text_in = message.text.strip()
+
+    if USER_INPUT_STATE.get(user_id) == "await_image_prompt":
+        USER_INPUT_STATE.pop(user_id, None)
+        if not await ensure_subscribed(bot, user_id, message):
+            return
+        await run_image_generation(message, text_in)
+        return
 
     if USER_INPUT_STATE.get(user_id) == "promo_activate":
         USER_INPUT_STATE.pop(user_id, None)
@@ -2468,7 +2750,6 @@ async def handle_prompt(message: Message, bot: Bot):
                 pass
             text, kb = await render_user_card(target_id, page)
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
             return
 
         elif action.startswith("adm_u_req_cust:"):
@@ -2488,7 +2769,6 @@ async def handle_prompt(message: Message, bot: Bot):
                 pass
             text, kb = await render_user_card(target_id, page)
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            asyncio.create_task(send_db_backup(bot, reason=f"Начисление запросов ({target_id})"))
             return
 
         elif action.startswith("adm_u_subreq_cust:"):
@@ -2613,6 +2893,7 @@ async def setup_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="Запустить бота / Главное меню"),
         BotCommand(command="menu", description="Выбрать нейросеть"),
+        BotCommand(command="img", description="Сгенерировать картинку по описанию"),
         BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
         BotCommand(command="shop", description="Купить подписку или пакет запросов"),
         BotCommand(command="top", description="Еженедельный лидерборд и призы"),
@@ -2627,7 +2908,6 @@ async def main():
     await setup_bot_commands(bot)
     asyncio.create_task(weekly_leaderboard_watcher(bot))
     asyncio.create_task(delayed_discount_watcher(bot))
-    asyncio.create_task(auto_backup_watcher(bot))
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен!")
