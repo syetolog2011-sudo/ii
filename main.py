@@ -1968,30 +1968,25 @@ async def cb_clear_chat(call: CallbackQuery):
 
 @router.callback_query(F.data == "ref_info")
 async def cb_ref_info(call: CallbackQuery, bot: Bot):
-    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+    try:
+        if not await ensure_subscribed(bot, call.from_user.id, call.message):
+            await call.answer()
+            return
+        me = await bot.get_me()
+        bot_username = me.username or "AetherNeural_bot"
+        ref_link = f"https://t.me/{bot_username}?start={call.from_user.id}"
+        await call.message.answer(
+            f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
+            f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
+            f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
+            f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
+            f"🔗 Твоя ссылка (нажми, чтобы скопировать):\n<code>{ref_link}</code>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         await call.answer()
-        return
-    me = await bot.get_me()
-    ref_link = f"[https://t.me/](https://t.me/){me.username}?start={call.from_user.id}"
-    share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
-    share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){quote(ref_link)}&text={share_text}"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
-        ]
-    )
-    await call.message.answer(
-        f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
-        f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
-        f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
-        f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
-        f"🔗 Твоя ссылка (нажми, чтобы скопировать):\n<code>{ref_link}</code>",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    await call.answer()
+    except Exception as e:
+        await call.answer(f"Ошибка: {str(e)[:150]}", show_alert=True)
 
 
 @router.callback_query(F.data == "shop")
