@@ -8,7 +8,6 @@ import shutil
 import string
 import time
 from datetime import date, datetime
-from urllib.parse import quote
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
@@ -146,6 +145,13 @@ USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
 BROADCAST_DRAFT: dict[str, int] = {}
 MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
+USER_QUOTA_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in USER_QUOTA_LOCKS:
+        USER_QUOTA_LOCKS[user_id] = asyncio.Lock()
+    return USER_QUOTA_LOCKS[user_id]
 
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
@@ -213,7 +219,6 @@ def get_product_price(product: dict, discount_active: bool) -> int:
 
 # ================= БАЗА ДАННЫХ (С АВТОБЭКАПОМ ПЕРЕД СТАРТОМ) =================
 async def init_db():
-    # Делаем резервную копию существующей базы перед любыми операциями
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         try:
             shutil.copy2(DB_PATH, f"{DB_PATH}.bak")
@@ -264,6 +269,11 @@ async def init_db():
         await db.execute(
             "UPDATE users SET first_seen_at = COALESCE(NULLIF(joined_at, 0), ?) WHERE first_seen_at = 0 OR first_seen_at IS NULL",
             (time.time(),),
+        )
+        # Нормализуем возможные старые значения used_today, если где-то превышали лимит
+        await db.execute(
+            "UPDATE users SET used_today = (? + bonus_limit) WHERE used_today > (? + bonus_limit)",
+            (FREE_DAILY_LIMIT, FREE_DAILY_LIMIT),
         )
 
         await db.execute("""
@@ -432,46 +442,70 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
         return user
 
 
-async def try_consume_quota(user_id: int, pro_active: bool) -> str | None:
+async def try_consume_quota(user_id: int, pro_active: bool, count: int = 1) -> dict | None:
+    """
+    Атомарно (под блокировкой пользователя) проверяет и списывает ровно `count` запросов:
+    сначала из дневного лимита (никогда не превышая FREE_DAILY_LIMIT + bonus_limit),
+    остаток — из пакета extra_requests.
+    Возвращает словарь списания {"pro": bool, "daily": int, "extra": int} или None, если не хватает.
+    """
     if pro_active:
-        return "pro"
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            UPDATE users
-            SET used_today = used_today + 1
-            WHERE user_id = ? AND used_today < (? + bonus_limit)
-            """,
-            (user_id, FREE_DAILY_LIMIT),
-        )
-        if cur.rowcount > 0:
+        return {"pro": True, "daily": 0, "extra": 0}
+
+    lock = get_user_lock(user_id)
+    async with lock:
+        user = await get_user(user_id)
+        total_daily_limit = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
+        used_today = user.get("used_today") or 0
+        extra_left = user.get("extra_requests") or 0
+
+        daily_left = max(0, total_daily_limit - used_today)
+        if daily_left + extra_left < count:
+            return None
+
+        take_daily = min(daily_left, count)
+        take_extra = count - take_daily
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                """
+                UPDATE users
+                SET used_today = used_today + ?,
+                    extra_requests = extra_requests - ?
+                WHERE user_id = ?
+                  AND (used_today + ?) <= (? + bonus_limit)
+                  AND extra_requests >= ?
+                """,
+                (take_daily, take_extra, user_id, take_daily, FREE_DAILY_LIMIT, take_extra),
+            )
+            if cur.rowcount == 0:
+                return None
             await db.commit()
-            return "daily"
 
-        cur2 = await db.execute(
-            """
-            UPDATE users
-            SET extra_requests = extra_requests - 1
-            WHERE user_id = ? AND extra_requests > 0
-            """,
-            (user_id,),
-        )
-        if cur2.rowcount > 0:
-            await db.commit()
-            return "extra"
-
-        return None
+        return {"pro": False, "daily": take_daily, "extra": take_extra}
 
 
-async def refund_quota(user_id: int, source: str | None):
-    if not source or source == "pro":
+async def refund_quota(user_id: int, receipt: dict | None):
+    if not receipt or receipt.get("pro"):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        if source == "daily":
-            await db.execute("UPDATE users SET used_today = MAX(0, used_today - 1) WHERE user_id = ?", (user_id,))
-        elif source == "extra":
-            await db.execute("UPDATE users SET extra_requests = extra_requests + 1 WHERE user_id = ?", (user_id,))
-        await db.commit()
+    daily_back = receipt.get("daily", 0)
+    extra_back = receipt.get("extra", 0)
+    if daily_back <= 0 and extra_back <= 0:
+        return
+
+    lock = get_user_lock(user_id)
+    async with lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                UPDATE users
+                SET used_today = MAX(0, used_today - ?),
+                    extra_requests = extra_requests + ?
+                WHERE user_id = ?
+                """,
+                (daily_back, extra_back, user_id),
+            )
+            await db.commit()
 
 
 async def reward_referrer_if_needed(user_id: int, bot: Bot):
@@ -1842,7 +1876,7 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото (можно сразу до 10 фото альбомом).\n\n"
+        f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото (1 фото = 1 запрос).\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
         f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
@@ -1974,7 +2008,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
             return
         me = await bot.get_me()
         bot_username = me.username or "AetherNeural_bot"
-        ref_link = f"https://t.me/{bot_username}?start={call.from_user.id}"
+        ref_link = f"[https://t.me/](https://t.me/){bot_username}?start={call.from_user.id}"
         await call.message.answer(
             f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
             f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
@@ -2148,7 +2182,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (ДО 10 ФОТО ЗА РАЗ) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2160,21 +2194,27 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
     if not await ensure_subscribed(bot, user_id, first_msg):
         return
 
+    count = len(messages)
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
-    quota_source = await try_consume_quota(user_id, pro_active)
-    if not quota_source:
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=count)
+    if not quota_receipt:
         disc = has_active_discount(user)
+        total_limit = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
+        daily_left = max(0, total_limit - (user.get("used_today") or 0))
+        extra_left = user.get("extra_requests") or 0
+        avail = daily_left + extra_left
         await first_msg.answer(
-            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Оформи подписку или возьми пакет запросов:",
+            f"⏳ <b>Недостаточно запросов для обработки {count} фото</b> (1 фото = 1 запрос).\n"
+            f"Сейчас доступно: <b>{avail} запр.</b>\n\n"
+            "Отправь меньше фотографий за раз, пригласи друга (/top) или оформи подписку / пакет:",
             reply_markup=shop_kb(disc),
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    count = len(messages)
     shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     status_label = (
-        f"📸 <i>Анализирую {count} фото ({shown_model})...</i>"
+        f"📸 <i>Анализирую {count} фото (-{count} запр., {shown_model})...</i>"
         if count > 1
         else f"📸 <i>Анализирую изображение ({shown_model})...</i>"
     )
@@ -2208,14 +2248,17 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         await add_history(user_id, "assistant", answer_text)
 
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+            await db.execute(
+                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
+                (count, user_id),
+            )
             await db.commit()
 
         await wait_msg.delete()
         await send_formatted_answer(first_msg, answer_text)
 
     except Exception as e:
-        await refund_quota(user_id, quota_source)
+        await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
             f"⚠️ <b>Не удалось распознать фото:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
@@ -2224,7 +2267,6 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
-    # Если админ отправил фото в режиме рассылки
     if message.from_user.id == ADMIN_ID and USER_INPUT_STATE.get(ADMIN_ID) == "adm_broadcast_msg":
         USER_INPUT_STATE.pop(ADMIN_ID, None)
         BROADCAST_DRAFT["chat_id"] = message.chat.id
@@ -2431,8 +2473,8 @@ async def handle_prompt(message: Message, bot: Bot):
         )
         return
 
-    quota_source = await try_consume_quota(user_id, pro_active)
-    if not quota_source:
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
+    if not quota_receipt:
         disc = has_active_discount(user)
         await message.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
@@ -2463,7 +2505,7 @@ async def handle_prompt(message: Message, bot: Bot):
         await send_formatted_answer(message, answer_text)
 
     except Exception as e:
-        await refund_quota(user_id, quota_source)
+        await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
             f"⚠️ <b>Сервер нейросетей временно перегружен:</b>\n<code>{str(e)[:250]}</code>\n\nПопробуй повторить запрос через минуту.",
             parse_mode=ParseMode.HTML,
