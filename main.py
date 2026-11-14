@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import html
 import os
 import random
+import re
 import string
 import time
 from datetime import date, datetime
@@ -36,7 +38,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1991878700"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AetherNeural")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/AetherNeural")
 
-# Путь к базе (на некоторых хостингах для сохранения при редеплое используют папку /data или текущую)
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
 FREE_DAILY_LIMIT = 5
@@ -128,6 +129,13 @@ PRODUCTS = {
     "pack_300": {"type": "pack", "title": "Пакет +300 запросов", "stars": 449, "value": 300},
 }
 
+SYSTEM_PROMPT = (
+    "Отвечай четко, по делу и на языке пользователя. "
+    "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
+    "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2). "
+    "Не используй символы ### и --- для оформления."
+)
+
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
@@ -139,6 +147,58 @@ router = Router()
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
 ACTIVE_GENERATIONS: set[int] = set()
+
+
+# ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
+def format_ai_response(raw_text: str) -> tuple[str, str]:
+    """
+    Возвращает кортеж (html_text, plain_fallback_text).
+    Убирает LaTeX-слэши, ###, превращает **жирный** в <b>жирный</b> и ```код``` в <pre><code>.
+    """
+    text = raw_text.replace("\r\n", "\n")
+
+    # Убираем LaTeX-скобки и типичные команды
+    text = re.sub(r"\\\[\vert{}\\\]|\\\(\vert{}\\\)", "", text)
+    text = text.replace("$$", "")
+    text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
+    text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
+    text = text.replace(r"\cdot", "·").replace(r"\times", "×").replace(r"\approx", "≈").replace(r"\neq", "≠").replace(r"\leq", "≤").replace(r"\geq", "≥")
+    # Убираем оставшиеся LaTeX-команды вида \text{...}, \mathrm{...} и одиночные слэши
+    text = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+    text = text.replace("\\", "")
+
+    # Заменяем заголовки ### Заголовок на жирный текст
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"**\1**", text, flags=re.MULTILINE)
+    # Убираем горизонтальные разделители --- или ***
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Заменяем маркеры списка "* пункт" в начале строки на "• пункт"
+    text = re.sub(r"^\s*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
+
+    # Готовим чистый текст без разметки (запасной вариант)
+    plain = text.replace("**", "").replace("__", "").replace("```", "").replace("`", "")
+
+    # Конвертируем в безопасный Telegram HTML
+    escaped = html.escape(text)
+    # Блоки кода ```...```
+    escaped = re.sub(r"```(?:\w+)?\n?(.*?)```", r"<pre><code>\1</code></pre>", escaped, flags=re.DOTALL)
+    # Инлайн-код `...`
+    escaped = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", escaped)
+    # Жирный шрифт **...**
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+
+    return escaped.strip(), plain.strip()
+
+
+async def send_formatted_answer(message: Message, raw_text: str):
+    html_text, plain_text = format_ai_response(raw_text)
+    for i in range(0, len(html_text), 3800):
+        chunk_html = html_text[i : i + 3800]
+        chunk_plain = plain_text[i : i + 3800]
+        try:
+            await message.answer(chunk_html, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.answer(chunk_plain)
 
 
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ НЕДЕЛИ И ЦЕН =================
@@ -1453,7 +1513,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     me = await bot.get_me()
-    ref_link = f"https://t.me/{me.username}?start={call.from_user.id}"
+    ref_link = f"[https://t.me/](https://t.me/){me.username}?start={call.from_user.id}"
     await call.message.answer(
         f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
         f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
@@ -1558,7 +1618,7 @@ async def generate_text_with_engine(history: list[dict], user_text: str) -> str:
     candidates = [engine] + [m for m in FALLBACK_MODELS if m != engine]
 
     messages_payload = [
-        {"role": "system", "content": "Отвечай четко, по делу и на языке пользователя. Учитывай контекст предыдущих сообщений диалога."},
+        {"role": "system", "content": SYSTEM_PROMPT},
         *history,
         {"role": "user", "content": user_text},
     ]
@@ -1586,13 +1646,14 @@ async def generate_photo_with_engine(caption: str, b64_img: str) -> str:
     candidates = [engine] + [m for m in FALLBACK_MODELS if m != engine]
 
     messages_payload = [
+        {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": caption},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
             ],
-        }
+        },
     ]
 
     last_error = None
@@ -1657,8 +1718,7 @@ async def handle_photo(message: Message, bot: Bot):
             await db.commit()
 
         await wait_msg.delete()
-        for i in range(0, len(answer_text), 4000):
-            await message.answer(answer_text[i : i + 4000])
+        await send_formatted_answer(message, answer_text)
 
         await check_and_send_discount_offer(user_id, message)
 
@@ -1826,8 +1886,7 @@ async def handle_prompt(message: Message, bot: Bot):
             await db.commit()
 
         await wait_msg.delete()
-        for i in range(0, len(answer_text), 4000):
-            await message.answer(answer_text[i : i + 4000])
+        await send_formatted_answer(message, answer_text)
 
         await check_and_send_discount_offer(user_id, message)
 
