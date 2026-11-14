@@ -43,6 +43,7 @@ DB_PATH = os.getenv("DB_PATH", "users.db")
 FREE_DAILY_LIMIT = 5
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
+USERS_PER_PAGE = 8
 
 FALLBACK_MODELS = [
     "gpt-6-luna",
@@ -131,9 +132,9 @@ PRODUCTS = {
 
 SYSTEM_PROMPT = (
     "Отвечай четко, по делу и на языке пользователя. "
+    "Никогда не используй Markdown-разметку со звездочками (** или *) и решетками (###). Пиши обычным чистым текстом без выделения звездочками. "
     "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
-    "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2). "
-    "Не используй символы ### и --- для оформления."
+    "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2)."
 )
 
 ai_client = AsyncOpenAI(
@@ -151,10 +152,6 @@ ACTIVE_GENERATIONS: set[int] = set()
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
 def format_ai_response(raw_text: str) -> tuple[str, str]:
-    """
-    Возвращает кортеж (html_text, plain_fallback_text).
-    Убирает LaTeX-слэши, ###, превращает **жирный** в <b>жирный</b> и ```код``` в <pre><code>.
-    """
     text = raw_text.replace("\r\n", "\n")
 
     # Убираем LaTeX-скобки и типичные команды
@@ -162,30 +159,31 @@ def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = text.replace("$$", "")
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
     text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
-    text = text.replace(r"\cdot", "·").replace(r"\times", "×").replace(r"\approx", "≈").replace(r"\neq", "≠").replace(r"\leq", "≤").replace(r"\geq", "≥")
-    # Убираем оставшиеся LaTeX-команды вида \text{...}, \mathrm{...} и одиночные слэши
+    text = (
+        text.replace(r"\cdot", "·")
+        .replace(r"\times", "×")
+        .replace(r"\approx", "≈")
+        .replace(r"\neq", "≠")
+        .replace(r"\leq", "≤")
+        .replace(r"\geq", "≥")
+    )
     text = re.sub(r"\\[a-zA-Z]+\{([^{}]*)\}", r"\1", text)
     text = re.sub(r"\\[a-zA-Z]+", "", text)
     text = text.replace("\\", "")
 
-    # Заменяем заголовки ### Заголовок на жирный текст
-    text = re.sub(r"^#{1,6}\s*(.+)$", r"**\1**", text, flags=re.MULTILINE)
-    # Убираем горизонтальные разделители --- или ***
+    # Заменяем заголовки ### и маркеры списков
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"\1", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    # Заменяем маркеры списка "* пункт" в начале строки на "• пункт"
     text = re.sub(r"^\s*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
 
-    # Готовим чистый текст без разметки (запасной вариант)
-    plain = text.replace("**", "").replace("__", "").replace("```", "").replace("`", "")
+    # Полностью убираем все двойные звёздочки **
+    text = text.replace("**", "")
 
-    # Конвертируем в безопасный Telegram HTML
+    plain = text.replace("__", "").replace("```", "").replace("`", "")
+
     escaped = html.escape(text)
-    # Блоки кода ```...```
     escaped = re.sub(r"```(?:\w+)?\n?(.*?)```", r"<pre><code>\1</code></pre>", escaped, flags=re.DOTALL)
-    # Инлайн-код `...`
     escaped = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", escaped)
-    # Жирный шрифт **...**
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
 
     return escaped.strip(), plain.strip()
 
@@ -225,6 +223,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT DEFAULT 'Пользователь',
+                username TEXT DEFAULT '',
                 selected_model TEXT DEFAULT 'gpt-6-luna',
                 used_today INTEGER DEFAULT 0,
                 last_reset TEXT,
@@ -236,18 +235,21 @@ async def init_db():
                 total_requests INTEGER DEFAULT 0,
                 visited_models INTEGER DEFAULT 0,
                 discount_until REAL DEFAULT 0,
-                discount_offered INTEGER DEFAULT 0
+                discount_offered INTEGER DEFAULT 0,
+                joined_at REAL DEFAULT 0
             )
         """)
 
         new_cols = [
             ("full_name", "TEXT DEFAULT 'Пользователь'"),
+            ("username", "TEXT DEFAULT ''"),
             ("extra_requests", "INTEGER DEFAULT 0"),
             ("ref_rewarded", "INTEGER DEFAULT 0"),
             ("total_requests", "INTEGER DEFAULT 0"),
             ("visited_models", "INTEGER DEFAULT 0"),
             ("discount_until", "REAL DEFAULT 0"),
             ("discount_offered", "INTEGER DEFAULT 0"),
+            ("joined_at", "REAL DEFAULT 0"),
         ]
         for col_name, col_def in new_cols:
             try:
@@ -255,6 +257,16 @@ async def init_db():
             except Exception:
                 pass
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                product_key TEXT,
+                title TEXT,
+                stars INTEGER,
+                paid_at REAL
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS weekly_refs (
                 week_key TEXT,
@@ -360,7 +372,7 @@ async def clear_history(user_id: int):
         await db.commit()
 
 
-async def get_user(user_id: int, ref_id: int = 0, full_name: str = "") -> dict:
+async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username: str = "") -> dict:
     today_str = str(date.today())
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -370,12 +382,13 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "") -> dict:
         if not row:
             valid_ref = ref_id if (ref_id and ref_id != user_id) else 0
             clean_name = (full_name or "Пользователь")[:40]
+            clean_uname = (username or "")[:40]
             await db.execute(
                 """
-                INSERT INTO users (user_id, full_name, last_reset, referred_by, ref_rewarded)
-                VALUES (?, ?, ?, ?, 0)
+                INSERT INTO users (user_id, full_name, username, last_reset, referred_by, ref_rewarded, joined_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
                 """,
-                (user_id, clean_name, today_str, valid_ref),
+                (user_id, clean_name, clean_uname, today_str, valid_ref, time.time()),
             )
             await db.commit()
             return await get_user(user_id)
@@ -392,6 +405,10 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "") -> dict:
             updates.append("full_name = ?")
             params.append(full_name[:40])
             user["full_name"] = full_name[:40]
+        if username is not None and username != "" and user.get("username") != username[:40]:
+            updates.append("username = ?")
+            params.append(username[:40])
+            user["username"] = username[:40]
 
         if updates:
             params.append(user_id)
@@ -502,7 +519,7 @@ async def distribute_weekly_rewards(bot: Bot, week_to_close: str) -> str:
         for idx, w in enumerate(winners, start=1):
             uid = w["referrer_id"]
             cnt = w["count"]
-            name = w["full_name"] or str(uid)
+            name = html.escape(w["full_name"] or str(uid))
 
             if idx == 1:
                 days = 30
@@ -741,24 +758,305 @@ async def admin_kb() -> InlineKeyboardMarkup:
     engine = await get_engine_model()
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
             [InlineKeyboardButton(text=f"⚙️ Движок API: {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🏆 Завершить неделю и выдать призы", callback_data="adm_finish_week")],
             [InlineKeyboardButton(text="👑 Выдать Премиум себе (30 дн.)", callback_data="adm_self_pro")],
-            [InlineKeyboardButton(text="🎁 Выдать подписку по ID", callback_data="adm_give_pro")],
-            [InlineKeyboardButton(text="❌ Забрать подписку по ID", callback_data="adm_remove_pro")],
-            [InlineKeyboardButton(text="➕ Добавить лимит запросов по ID", callback_data="adm_give_limit")],
             [InlineKeyboardButton(text="🔌 Проверить живые модели API", callback_data="adm_check_api")],
             [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_cats")],
         ]
     )
 
 
-def admin_cancel_kb() -> InlineKeyboardMarkup:
+def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]]
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
     )
+
+
+# ================= АДМИН: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =================
+async def render_users_list_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    offset = page * USERS_PER_PAGE
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT * FROM users ORDER BY total_requests DESC, user_id DESC LIMIT ? OFFSET ?",
+            (USERS_PER_PAGE, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    total_pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    lines = [
+        f"👥 <b>База пользователей (стр. {page + 1}/{total_pages}, всего: {total})</b>\n",
+        "Нажми на пользователя, чтобы посмотреть его статистику, покупки или выдать подписку / запросы:\n",
+    ]
+    buttons = []
+    now = time.time()
+
+    for r in rows:
+        uid = r["user_id"]
+        name = r["full_name"] or "Без имени"
+        badge = "👑" if (r["pro_until"] or 0) > now else "🆓"
+        reqs = r["total_requests"] or 0
+        lines.append(f"{badge} <b>{html.escape(name)}</b> (<code>{uid}</code>) — {reqs} запр.")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{badge} {name[:22]} | ID {uid} ({reqs} запр.)",
+                callback_data=f"adm_u_view:{uid}:{page}",
+            )
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_users:{page - 1}"))
+    if offset + USERS_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"adm_users:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton(text="🔍 Найти по ID или имени", callback_data="adm_u_search")])
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    user = await get_user(target_id)
+    now = time.time()
+    pro_active = is_pro(user)
+
+    if pro_active:
+        if user["pro_until"] > now + 365 * 5 * 86400:
+            sub_str = "👑 <b>Активна (НАВСЕГДА)</b>"
+        else:
+            exp = datetime.fromtimestamp(user["pro_until"]).strftime("%d.%m.%Y %H:%M")
+            sub_str = f"👑 <b>Активна до {exp}</b>"
+    else:
+        sub_str = "🆓 <b>Не активна</b>"
+
+    total_daily = FREE_DAILY_LIMIT + user["bonus_limit"]
+    left_today = max(0, total_daily - user["used_today"])
+    uname_str = f" (@{user['username']})" if user.get("username") else ""
+    joined_str = (
+        datetime.fromtimestamp(user["joined_at"]).strftime("%d.%m.%Y %H:%M")
+        if user.get("joined_at")
+        else "неизвестно"
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by = ? AND ref_rewarded = 1",
+            (target_id,),
+        ) as cur:
+            refs_count = (await cur.fetchone())[0]
+
+        async with db.execute(
+            "SELECT title, stars, paid_at FROM payments WHERE user_id = ? ORDER BY paid_at DESC LIMIT 10",
+            (target_id,),
+        ) as cur:
+            pay_rows = await cur.fetchall()
+
+        async with db.execute(
+            "SELECT COALESCE(SUM(stars), 0) FROM payments WHERE user_id = ?",
+            (target_id,),
+        ) as cur:
+            total_stars = (await cur.fetchone())[0]
+
+    if pay_rows:
+        pay_lines = []
+        for p in pay_rows:
+            p_date = datetime.fromtimestamp(p["paid_at"]).strftime("%d.%m.%y %H:%M")
+            pay_lines.append(f"  • {html.escape(p['title'])} — <b>{p['stars']} ⭐</b> ({p_date})")
+        payments_block = "\n".join(pay_lines)
+    else:
+        payments_block = "  <i>Покупок пока нет</i>"
+
+    cur_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
+    ref_by = f"<code>{user['referred_by']}</code>" if user.get("referred_by") else "сам пришёл"
+
+    text = (
+        f"👤 <b>Карточка пользователя</b>\n\n"
+        f"📛 Имя: <b>{html.escape(user.get('full_name') or 'Пользователь')}</b>{uname_str}\n"
+        f"🆔 ID: <code>{target_id}</code>\n"
+        f"📅 В боте с: <b>{joined_str}</b>\n"
+        f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n\n"
+        f"💎 Подписка: {sub_str}\n"
+        f"🤖 Модель: <b>{cur_model}</b>\n"
+        f"⚡ Запросы сегодня: <b>{user['used_today']}/{total_daily}</b> (осталось {left_today})\n"
+        f"📦 Вечные пакеты: <b>{user.get('extra_requests', 0)} шт.</b>\n"
+        f"🎁 Бонус к дневному лимиту: <b>+{user['bonus_limit']} в день</b>\n"
+        f"📊 Всего запросов за всё время: <b>{user.get('total_requests', 0)}</b>\n\n"
+        f"💳 <b>История покупок (всего на {total_stars} ⭐):</b>\n"
+        f"{payments_block}"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👑 +1 дн.", callback_data=f"adm_u_pro:{target_id}:1:{back_page}"),
+                InlineKeyboardButton(text="👑 +7 дн.", callback_data=f"adm_u_pro:{target_id}:7:{back_page}"),
+                InlineKeyboardButton(text="👑 +30 дн.", callback_data=f"adm_u_pro:{target_id}:30:{back_page}"),
+            ],
+            [
+                InlineKeyboardButton(text="♾ PRO навсегда", callback_data=f"adm_u_pro:{target_id}:3650:{back_page}"),
+                InlineKeyboardButton(text="✏️ Свой срок PRO", callback_data=f"adm_u_pro_cust:{target_id}:{back_page}"),
+            ],
+            [
+                InlineKeyboardButton(text="⚡ +10 запр.", callback_data=f"adm_u_req:{target_id}:10:{back_page}"),
+                InlineKeyboardButton(text="⚡ +50 запр.", callback_data=f"adm_u_req:{target_id}:50:{back_page}"),
+                InlineKeyboardButton(text="✏️ Свои запр.", callback_data=f"adm_u_req_cust:{target_id}:{back_page}"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Снять PRO", callback_data=f"adm_u_delpro:{target_id}:{back_page}"),
+                InlineKeyboardButton(text="🔄 Сброс дня", callback_data=f"adm_u_resetday:{target_id}:{back_page}"),
+            ],
+            [InlineKeyboardButton(text="⬅️ К списку пользователей", callback_data=f"adm_users:{back_page}")],
+        ]
+    )
+    return text, kb
+
+
+@router.callback_query(F.data.startswith("adm_users:"))
+async def cb_adm_users(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    page = int(call.data.split(":", 1)[1])
+    text, kb = await render_users_list_page(page)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_u_search")
+async def cb_adm_u_search(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE[ADMIN_ID] = "adm_u_search"
+    await call.message.edit_text(
+        "🔍 <b>Поиск пользователя</b>\n\n"
+        "Отправь числовой <b>ID пользователя</b>, его <b>@username</b> или часть <b>имени</b>:",
+        reply_markup=admin_cancel_kb("adm_users:0"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_u_view:"))
+async def cb_adm_u_view(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    _, uid_s, page_s = call.data.split(":")
+    text, kb = await render_user_card(int(uid_s), int(page_s))
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_u_pro:"))
+async def cb_adm_u_pro(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, days_s, page_s = call.data.split(":")
+    target_id, days, page = int(uid_s), int(days_s), int(page_s)
+    target = await get_user(target_id)
+    new_until = max(time.time(), target["pro_until"]) + days * 86400
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, target_id))
+        await db.commit()
+    await call.answer(f"👑 Выдано +{days} дн. PRO!")
+    try:
+        msg_days = "НАВСЕГДА" if days >= 3650 else f"на {days} дн."
+        await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку {msg_days}!</b> Открой /menu.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_u_pro_cust:"))
+async def cb_adm_u_pro_cust(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    USER_INPUT_STATE[ADMIN_ID] = f"adm_u_pro_cust:{uid_s}:{page_s}"
+    await call.message.edit_text(
+        f"👑 Введи количество дней подписки числом для пользователя <code>{uid_s}</code>:",
+        reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_u_req:"))
+async def cb_adm_u_req(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, amount_s, page_s = call.data.split(":")
+    target_id, amount, page = int(uid_s), int(amount_s), int(page_s)
+    await get_user(target_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (amount, target_id))
+        await db.commit()
+    await call.answer(f"⚡ Начислено +{amount} запросов!")
+    try:
+        await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>+{amount} запросов навсегда!</b>", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_u_req_cust:"))
+async def cb_adm_u_req_cust(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    USER_INPUT_STATE[ADMIN_ID] = f"adm_u_req_cust:{uid_s}:{page_s}"
+    await call.message.edit_text(
+        f"⚡ Введи количество вечных запросов числом для пользователя <code>{uid_s}</code>:",
+        reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_u_delpro:"))
+async def cb_adm_u_delpro(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    target_id, page = int(uid_s), int(page_s)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET pro_until = 0 WHERE user_id = ?", (target_id,))
+        await db.commit()
+    await call.answer("❌ Подписка снята")
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_u_resetday:"))
+async def cb_adm_u_resetday(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    target_id, page = int(uid_s), int(page_s)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET used_today = 0 WHERE user_id = ?", (target_id,))
+        await db.commit()
+    await call.answer("🔄 Дневной счётчик запросов обнулён")
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ================= ЛИДЕРБОРД НЕДЕЛИ =================
@@ -803,7 +1101,7 @@ async def render_leaderboard_text(user_id: int) -> str:
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         for idx, r in enumerate(top_rows, start=1):
             prefix = medals.get(idx, f"{idx}.")
-            name = r["full_name"] or f"ID {r['referrer_id']}"
+            name = html.escape(r["full_name"] or f"ID {r['referrer_id']}")
             lines.append(f"{prefix} <b>{name}</b> — {r['count']} др.")
 
     lines.append(f"\n👤 Твой результат за неделю: <b>{my_count} др.</b>")
@@ -812,7 +1110,7 @@ async def render_leaderboard_text(user_id: int) -> str:
 
 @router.message(Command("top"))
 async def cmd_top(message: Message, bot: Bot):
-    await get_user(message.from_user.id, full_name=message.from_user.full_name)
+    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
     kb = InlineKeyboardMarkup(
@@ -845,7 +1143,7 @@ async def cb_leaderboard(call: CallbackQuery, bot: Bot):
 # ================= ПРОВЕРКА ПОДПИСКИ CALLBACK =================
 @router.callback_query(F.data == "check_sub")
 async def cb_check_sub(call: CallbackQuery, bot: Bot):
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name)
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     if await check_channel_sub(bot, call.from_user.id):
         await reward_referrer_if_needed(call.from_user.id, bot)
         cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
@@ -890,7 +1188,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         disc_line = f"\n🔥 Персональная скидка 50%: <b>Активна до {d_exp}</b>"
 
     return (
-        f"👤 <b>Профиль — {first_name}</b>\n\n"
+        f"👤 <b>Профиль — {html.escape(first_name)}</b>\n\n"
         f"🆔 Твой ID: <code>{user_id}</code>\n"
         f"{sub_block}\n"
         f"{req_block}\n"
@@ -903,7 +1201,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
 @router.message(Command("profile"))
 async def cmd_profile(message: Message, bot: Bot):
     USER_INPUT_STATE.pop(message.from_user.id, None)
-    await get_user(message.from_user.id, full_name=message.from_user.full_name)
+    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
     text = await render_profile_text(message.from_user.id, message.from_user.first_name)
@@ -993,15 +1291,18 @@ async def render_admin_text() -> str:
             today_reqs = (await cur.fetchone())[0] or 0
         async with db.execute("SELECT COUNT(*) FROM promocodes") as cur:
             promos_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COALESCE(SUM(stars), 0) FROM payments") as cur:
+            total_stars = (await cur.fetchone())[0]
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
         f"⚙️ Активный движок: <code>{engine}</code>\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"👑 Активных подписок: <b>{pro_users}</b>\n"
+        f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
         f"🎟 Создано промокодов: <b>{promos_count}</b>\n"
         f"⚡ Запросов сегодня: <b>{today_reqs}</b>\n\n"
-        "<i>Команды:\n"
+        "<i>Быстрые команды:\n"
         "<code>/givepro ID ДНИ</code> — выдать подписку\n"
         "<code>/delpro ID</code> — снять подписку</i>"
     )
@@ -1296,42 +1597,6 @@ async def cb_adm_self_pro(call: CallbackQuery):
     await cb_admin_panel(call)
 
 
-@router.callback_query(F.data == "adm_give_pro")
-async def cb_adm_give_pro(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    USER_INPUT_STATE[ADMIN_ID] = "give_pro"
-    await call.message.edit_text(
-        "🎁 <b>Выдача подписки</b>\n\nОтправь <b>ID пользователя</b> и <b>количество дней</b> через пробел.\nПример: <code>123456789 7</code>",
-        reply_markup=admin_cancel_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.callback_query(F.data == "adm_remove_pro")
-async def cb_adm_remove_pro(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    USER_INPUT_STATE[ADMIN_ID] = "remove_pro"
-    await call.message.edit_text(
-        "❌ <b>Снятие подписки</b>\n\nОтправь <b>ID пользователя</b>:\nПример: <code>123456789</code>",
-        reply_markup=admin_cancel_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.callback_query(F.data == "adm_give_limit")
-async def cb_adm_give_limit(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    USER_INPUT_STATE[ADMIN_ID] = "give_limit"
-    await call.message.edit_text(
-        "➕ <b>Добавление запросов навсегда</b>\n\nОтправь <b>ID пользователя</b> и <b>количество запросов</b> через пробел:\nПример: <code>123456789 20</code>",
-        reply_markup=admin_cancel_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
 @router.message(Command("givepro"))
 async def cmd_givepro(message: Message, bot: Bot):
     if message.from_user.id != ADMIN_ID:
@@ -1375,14 +1640,19 @@ async def cmd_start(message: Message, bot: Bot):
     USER_INPUT_STATE.pop(message.from_user.id, None)
     args = message.text.split()
     ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
-    user = await get_user(message.from_user.id, ref_id, full_name=message.from_user.full_name)
+    user = await get_user(
+        message.from_user.id,
+        ref_id,
+        full_name=message.from_user.full_name,
+        username=message.from_user.username or "",
+    )
 
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
 
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
         f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото задачи.\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
@@ -1394,7 +1664,7 @@ async def cmd_start(message: Message, bot: Bot):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, bot: Bot):
     USER_INPUT_STATE.pop(message.from_user.id, None)
-    user = await get_user(message.from_user.id, full_name=message.from_user.full_name)
+    user = await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
@@ -1410,7 +1680,7 @@ async def cmd_menu(message: Message, bot: Bot):
 @router.message(Command("shop"))
 async def cmd_shop(message: Message, bot: Bot):
     USER_INPUT_STATE.pop(message.from_user.id, None)
-    user = await get_user(message.from_user.id, full_name=message.from_user.full_name)
+    user = await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
     disc = has_active_discount(user)
@@ -1434,7 +1704,7 @@ async def cb_open_category(call: CallbackQuery, bot: Bot):
         await db.commit()
 
     cat_key = call.data.split(":", 1)[1]
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name)
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     cat = CATEGORIES[cat_key]
     pro_active = is_pro(user)
 
@@ -1455,7 +1725,7 @@ async def cb_set_model(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     _, cat_key, model_id = call.data.split(":", 2)
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name)
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     model_info = ALL_MODELS_MAP.get(model_id)
     pro_active = is_pro(user)
 
@@ -1486,7 +1756,7 @@ async def cb_back_cats(call: CallbackQuery, bot: Bot):
     if not await ensure_subscribed(bot, call.from_user.id, call.message):
         await call.answer()
         return
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name)
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     try:
         await call.message.edit_text(
@@ -1530,7 +1800,7 @@ async def cb_shop(call: CallbackQuery, bot: Bot):
     if not await ensure_subscribed(bot, call.from_user.id, call.message):
         await call.answer()
         return
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name)
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     disc = has_active_discount(user)
     try:
         await call.message.edit_text(render_shop_text(user), reply_markup=shop_kb(disc), parse_mode=ParseMode.HTML)
@@ -1577,39 +1847,44 @@ async def successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload
     prod_key = payload.split(":", 1)[1]
     product = PRODUCTS[prod_key]
+    paid_stars = message.successful_payment.total_amount
     user = await get_user(message.from_user.id)
 
-    if product["type"] == "sub":
-        days = product["value"]
-        base_time = max(time.time(), user["pro_until"])
-        new_pro_until = base_time + days * 86400
-        exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO payments (user_id, product_key, title, stars, paid_at) VALUES (?, ?, ?, ?, ?)",
+            (message.from_user.id, prod_key, product["title"], paid_stars, time.time()),
+        )
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        if product["type"] == "sub":
+            days = product["value"]
+            base_time = max(time.time(), user["pro_until"])
+            new_pro_until = base_time + days * 86400
+            exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
+
             await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_pro_until, message.from_user.id))
             await db.commit()
 
-        await message.answer(
-            f"🎉 <b>Оплата прошла успешно!</b>\n"
-            f"Тариф <b>«{product['title']}»</b> активен до <b>{exp_date}</b>.\n"
-            f"Все модели разблокированы в /menu.",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        packs = product["value"]
-        async with aiosqlite.connect(DB_PATH) as db:
+            await message.answer(
+                f"🎉 <b>Оплата прошла успешно!</b>\n"
+                f"Тариф <b>«{product['title']}»</b> активен до <b>{exp_date}</b>.\n"
+                f"Все модели разблокированы в /menu.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            packs = product["value"]
             await db.execute(
                 "UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?",
                 (packs, message.from_user.id),
             )
             await db.commit()
 
-        await message.answer(
-            f"🎉 <b>Оплата прошла успешно!</b>\n"
-            f"На твой баланс зачислено <b>+{packs} запросов навсегда</b>.\n"
-            f"Проверить остаток можно в /profile.",
-            parse_mode=ParseMode.HTML,
-        )
+            await message.answer(
+                f"🎉 <b>Оплата прошла успешно!</b>\n"
+                f"На твой баланс зачислено <b>+{packs} запросов навсегда</b>.\n"
+                f"Проверить остаток можно в /profile.",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 # ================= ЕДИНАЯ ГЕНЕРАЦИЯ (ТЕКСТ И ФОТО ЧЕРЕЗ ENGINE_MODEL) =================
@@ -1678,7 +1953,7 @@ async def generate_photo_with_engine(caption: str, b64_img: str) -> str:
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     user_id = message.from_user.id
-    user = await get_user(user_id, full_name=message.from_user.full_name)
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, user_id, message):
         return
 
@@ -1748,9 +2023,71 @@ async def handle_prompt(message: Message, bot: Bot):
 
     if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
         action = USER_INPUT_STATE.pop(ADMIN_ID)
-        parts = text_in.split()
 
-        if action == "promo_custom_val":
+        if action == "adm_u_search":
+            q = text_in.lstrip("@").strip()
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                if q.isdigit():
+                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(q),)) as cur:
+                        row = await cur.fetchone()
+                else:
+                    async with db.execute(
+                        "SELECT user_id FROM users WHERE username LIKE ? OR full_name LIKE ? LIMIT 1",
+                        (f"%{q}%", f"%{q}%"),
+                    ) as cur:
+                        row = await cur.fetchone()
+
+            if not row:
+                await message.answer(
+                    "❌ Пользователь не найден в базе.",
+                    reply_markup=admin_cancel_kb("adm_users:0"),
+                )
+                return
+            text, kb = await render_user_card(row["user_id"], 0)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_pro_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число дней:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, days, page = int(uid_s), int(text_in), int(page_s)
+            target = await get_user(target_id)
+            new_until = max(time.time(), target["pro_until"]) + days * 86400
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, target_id))
+                await db.commit()
+            try:
+                await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_req_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
+            await get_user(target_id)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (amount, target_id))
+                await db.commit()
+            try:
+                await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>+{amount} запросов навсегда!</b>", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action == "promo_custom_val":
             if not text_in.isdigit() or int(text_in) <= 0:
                 USER_INPUT_STATE[ADMIN_ID] = "promo_custom_val"
                 await message.answer("⚠️ Введи положительное целое число:", reply_markup=admin_cancel_kb())
@@ -1788,60 +2125,7 @@ async def handle_prompt(message: Message, bot: Bot):
             )
             return
 
-        elif action == "give_pro":
-            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                await message.answer("⚠️ Неверный формат. Нужно: <code>ID ДНИ</code>", reply_markup=await admin_kb(), parse_mode=ParseMode.HTML)
-                return
-            target_id, days = int(parts[0]), int(parts[1])
-            target = await get_user(target_id)
-            new_until = max(time.time(), target["pro_until"]) + days * 86400
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, target_id))
-                await db.commit()
-            exp_date = datetime.fromtimestamp(new_until).strftime("%d.%m.%Y %H:%M")
-            await message.answer(
-                f"✅ Пользователю <code>{target_id}</code> выдана подписка на <b>{days} дн.</b> (до {exp_date})",
-                reply_markup=await admin_kb(),
-                parse_mode=ParseMode.HTML,
-            )
-            try:
-                await bot.send_message(target_id, f"🎁 Тебе выдана <b>подписка на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-            return
-
-        elif action == "remove_pro":
-            if not parts[0].isdigit():
-                await message.answer("⚠️ Нужно указать числовой ID.", reply_markup=await admin_kb())
-                return
-            target_id = int(parts[0])
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET pro_until = 0 WHERE user_id = ?", (target_id,))
-                await db.commit()
-            await message.answer(
-                f"❌ У пользователя <code>{target_id}</code> снята подписка.",
-                reply_markup=await admin_kb(),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        elif action == "give_limit":
-            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                await message.answer("⚠️ Неверный формат. Нужно: <code>ID ЗАПРОСЫ</code>", reply_markup=await admin_kb(), parse_mode=ParseMode.HTML)
-                return
-            target_id, bonus = int(parts[0]), int(parts[1])
-            await get_user(target_id)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (bonus, target_id))
-                await db.commit()
-            await message.answer(
-                f"✅ Пользователю <code>{target_id}</code> добавлено <b>+{bonus}</b> запросов навсегда.",
-                reply_markup=await admin_kb(),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-    user = await get_user(user_id, full_name=message.from_user.full_name)
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
 
     if not await ensure_subscribed(bot, user_id, message):
         return
