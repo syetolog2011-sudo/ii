@@ -159,7 +159,7 @@ PRODUCTS = {
 SYSTEM_PROMPT = (
     "Отвечай четко, по делу и на языке пользователя. "
     "Никогда не используй Markdown-разметку со звездочками (** или *) и решетками (###). Пиши обычным чистым текстом без выделения звездочками. "
-    "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[, \\], $$, \\sqrt и обратные слэши \\). "
+    "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
     "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2)."
 )
 
@@ -188,7 +188,7 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
 def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = raw_text.replace("\r\n", "\n")
 
-    text = re.sub(r"\\\[|\\\]|\\\(|\\\)", "", text)
+    text = re.sub(r"\\\[\vert{}\\\]|\\\(\vert{}\\\)", "", text)
     text = text.replace("$$", "")
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
     text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
@@ -2795,3 +2795,243 @@ async def handle_prompt(message: Message, bot: Bot):
 
     if USER_INPUT_STATE.get(user_id) == "await_image_prompt":
         USER_INPUT_STATE.pop(user_id, None)
+        if not await ensure_subscribed(bot, user_id, message):
+            return
+        await run_image_generation(message, text_in)
+        return
+
+    if USER_INPUT_STATE.get(user_id) == "promo_activate":
+        USER_INPUT_STATE.pop(user_id, None)
+        if not await ensure_subscribed(bot, user_id, message):
+            return
+        ok, reply_text = await redeem_promocode(user_id, text_in)
+        await message.answer(reply_text, reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
+        return
+
+    if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
+        action = USER_INPUT_STATE.pop(ADMIN_ID)
+
+        if action == "adm_broadcast_msg":
+            BROADCAST_DRAFT["chat_id"] = message.chat.id
+            BROADCAST_DRAFT["message_id"] = message.message_id
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Отправить всем пользователям", callback_data="adm_broadcast_confirm")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+                ]
+            )
+            await message.answer(
+                "👆 <b>Предпросмотр рассылки готов!</b>\nПодтвердить отправку этого сообщения всем пользователям бота?",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        elif action == "adm_u_search":
+            q = text_in.lstrip("@").strip()
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                if q.isdigit():
+                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(q),)) as cur:
+                        row = await cur.fetchone()
+                else:
+                    async with db.execute(
+                        "SELECT user_id FROM users WHERE username LIKE ? OR full_name LIKE ? LIMIT 1",
+                        (f"%{q}%", f"%{q}%"),
+                    ) as cur:
+                        row = await cur.fetchone()
+
+            if not row:
+                await message.answer(
+                    "❌ Пользователь не найден в базе.",
+                    reply_markup=admin_cancel_kb("adm_users:0"),
+                )
+                return
+            text, kb = await render_user_card(row["user_id"], 0)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_pro_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число дней:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, days, page = int(uid_s), int(text_in), int(page_s)
+            target = await get_user(target_id)
+            new_until = max(time.time(), target["pro_until"]) + days * 86400
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, target_id))
+                await db.commit()
+            try:
+                await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_req_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
+            await get_user(target_id)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (amount, target_id))
+                await db.commit()
+            try:
+                await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>пакет на +{amount} запросов!</b>", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_subreq_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
+            user_t = await get_user(target_id)
+            removed = min(user_t.get("extra_requests", 0), amount)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET extra_requests = MAX(0, extra_requests - ?) WHERE user_id = ?", (amount, target_id))
+                await db.commit()
+            if removed > 0:
+                try:
+                    await bot.send_message(
+                        target_id,
+                        f"⚠️ Администратор забрал у тебя <b>{removed} запросов</b> из пакета.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action == "promo_custom_val":
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = "promo_custom_val"
+                await message.answer("⚠️ Введи положительное целое число:", reply_markup=admin_cancel_kb())
+                return
+            PROMO_DRAFT["amount"] = int(text_in)
+            await show_promo_step3_uses(message, edit=False)
+            return
+
+        elif action == "promo_custom_uses":
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = "promo_custom_uses"
+                await message.answer("⚠️ Введи положительное целое число:", reply_markup=admin_cancel_kb())
+                return
+            PROMO_DRAFT["max_uses"] = int(text_in)
+            await show_promo_step4_code(message, edit=False)
+            return
+
+        elif action == "promo_code_name":
+            if " " in text_in or len(text_in) < 2:
+                USER_INPUT_STATE[ADMIN_ID] = "promo_code_name"
+                await message.answer("⚠️ Код должен быть одним словом без пробелов (минимум 2 символа):", reply_markup=admin_cancel_kb())
+                return
+            await save_promo_and_reply(text_in, message, edit=False)
+            return
+
+        elif action == "set_engine":
+            if not text_in or " " in text_in:
+                await message.answer("⚠️ Введи корректный ID модели без пробелов.", reply_markup=await admin_kb())
+                return
+            await set_engine_model(text_in)
+            await message.answer(
+                f"✅ Общий движок изменен на <code>{text_in}</code> (для обычных пользователей).",
+                reply_markup=await admin_kb(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+
+    if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    model_id = user["selected_model"]
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+
+    if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
+        disc = has_active_discount(user)
+        await message.answer(
+            "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
+            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    wait_msg = await message.answer("⏳ <i>Думаю...</i>", parse_mode=ParseMode.HTML)
+
+    try:
+        history = await get_history(user_id)
+        answer_text = await generate_text_response(
+            user_id=user_id,
+            selected_model=model_id,
+            history=history,
+            user_text=message.text,
+        )
+
+        await add_history(user_id, "user", message.text)
+        await add_history(user_id, "assistant", answer_text)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+        await wait_msg.delete()
+        await send_formatted_answer(message, answer_text)
+
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Сервер нейросетей временно перегружен:</b>\n<code>{str(e)[:250]}</code>\n\nПопробуй повторить запрос через минуту.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def setup_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Запустить бота / Главное меню"),
+        BotCommand(command="menu", description="Выбрать нейросеть"),
+        BotCommand(command="img", description="Сгенерировать картинку по описанию"),
+        BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
+        BotCommand(command="shop", description="Купить подписку или пакет запросов"),
+        BotCommand(command="top", description="Еженедельный лидерборд и призы"),
+        BotCommand(command="clear", description="Очистить память диалога"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+async def main():
+    await init_db()
+    bot = Bot(token=BOT_TOKEN)
+    await setup_bot_commands(bot)
+    asyncio.create_task(weekly_leaderboard_watcher(bot))
+    asyncio.create_task(delayed_discount_watcher(bot))
+    dp = Dispatcher()
+    dp.include_router(router)
+    print("Бот запущен!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
