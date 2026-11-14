@@ -48,20 +48,27 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
-PHOTO_COST = 5       # Сколько запросов списывать за 1 фото на разбор
-VIDEO_COST = 3       # Сколько запросов списывать за разбор входящего видео
-IMAGE_GEN_COST = 5   # Сколько запросов списывать за генерацию 1 картинки
+PHOTO_COST = 5              # Разбор 1 фото = 5 запросов
+VIDEO_COST = 3              # Разбор 1 видео = 3 запроса
+IMAGE_GEN_COST = 10         # Генерация 1 картинки = 10 запросов
+PRO_DAILY_IMAGE_LIMIT = 15  # Лимит генерации картинок в день по подписке PRO
+
 MAX_ALBUM_PHOTOS = 4
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
+DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "gpt-image-2.5-flare").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.5-flash-lite").strip()
 USERS_PER_PAGE = 8
 
-IMAGE_MODELS = [
-    m.strip()
-    for m in os.getenv("IMAGE_MODELS", "flux,gpt-image-1,dall-e-3").split(",")
-    if m.strip()
+IMAGE_MODEL_PRESETS = [
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-1",
+    "gpt-image-1.5",
+    "gpt-image-2",
+    "dall-e-3",
 ]
+
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
 
 DISCOUNT_DELAY_SECONDS = 2 * 3600      # Через 2 часа после первого сообщения
@@ -306,6 +313,7 @@ async def init_db():
                 username TEXT DEFAULT '',
                 selected_model TEXT DEFAULT 'gpt-6-luna',
                 used_today INTEGER DEFAULT 0,
+                images_today INTEGER DEFAULT 0,
                 last_reset TEXT,
                 pro_until REAL DEFAULT 0,
                 bonus_limit INTEGER DEFAULT 0,
@@ -324,6 +332,7 @@ async def init_db():
         new_cols = [
             ("full_name", "TEXT DEFAULT 'Пользователь'"),
             ("username", "TEXT DEFAULT ''"),
+            ("images_today", "INTEGER DEFAULT 0"),
             ("extra_requests", "INTEGER DEFAULT 0"),
             ("ref_rewarded", "INTEGER DEFAULT 0"),
             ("total_requests", "INTEGER DEFAULT 0"),
@@ -401,6 +410,10 @@ async def init_db():
             (DEFAULT_ENGINE_MODEL,),
         )
         await db.execute(
+            "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('image_model', ?)",
+            (DEFAULT_IMAGE_MODEL,),
+        )
+        await db.execute(
             "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('active_week', ?)",
             (current_week_key(),),
         )
@@ -449,6 +462,14 @@ async def get_engine_model() -> str:
 
 async def set_engine_model(model_id: str):
     await set_setting("engine_model", model_id)
+
+
+async def get_image_model() -> str:
+    return await get_setting("image_model", DEFAULT_IMAGE_MODEL)
+
+
+async def set_image_model(model_id: str):
+    await set_setting("image_model", model_id)
 
 
 async def add_history(user_id: int, role: str, content: str):
@@ -513,9 +534,10 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
         updates = []
         params = []
         if user["last_reset"] != today_str:
-            updates.append("used_today = 0, last_reset = ?")
+            updates.append("used_today = 0, images_today = 0, last_reset = ?")
             params.append(today_str)
             user["used_today"] = 0
+            user["images_today"] = 0
             user["last_reset"] = today_str
         if not user.get("first_seen_at"):
             updates.append("first_seen_at = ?")
@@ -665,7 +687,7 @@ async def delayed_discount_watcher(bot: Bot):
                     offer_text = (
                         "🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА 50% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
                         "Мы снизили цены вдвое на все тарифы и пакеты запросов специально для тебя на ближайшие <b>36 часов</b> (скидка уже применена ко всем ценам ниже):\n\n"
-                        "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
+                        "👑 <b>Подписки (безлимит на PRO-модели + до 15 фото в день):</b>\n"
                         f"• Пробный 1 день: <s>59 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_trial'], True)} ⭐</b>\n"
                         f"• Стандарт 7 дней: <s>149 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_standard'], True)} ⭐</b>\n"
                         f"• Премиум 30 дней: <s>349 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_premium'], True)} ⭐</b>\n\n"
@@ -888,7 +910,7 @@ def render_shop_text(user: dict) -> str:
     else:
         header = "⭐ <b>Магазин подписок и пакетов</b>\n\n"
 
-    lines = [header, "👑 <b>Безлимитные подписки (все PRO-модели):</b>"]
+    lines = [header, f"👑 <b>Подписки (безлимит на все PRO-модели + до {PRO_DAILY_IMAGE_LIMIT} фото/день):</b>"]
     for key in ("sub_trial", "sub_standard", "sub_premium"):
         p = PRODUCTS[key]
         price = get_product_price(p, disc)
@@ -923,16 +945,18 @@ def profile_kb() -> InlineKeyboardMarkup:
 
 async def admin_kb() -> InlineKeyboardMarkup:
     engine = await get_engine_model()
+    img_model = await get_image_model()
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
-            [InlineKeyboardButton(text="💾 Скачать бэкап базы вручную", callback_data="adm_backup_now")],
+            [InlineKeyboardButton(text=f"🎨 Модель картинок: {img_model}", callback_data="adm_img_model_menu")],
+            [InlineKeyboardButton(text=f"⚙️ Общий движок (текст): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
-            [InlineKeyboardButton(text=f"⚙️ Общий движок (для юзеров): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🏆 Завершить неделю и выдать призы", callback_data="adm_finish_week")],
             [InlineKeyboardButton(text="👑 Выдать Премиум себе (30 дн.)", callback_data="adm_self_pro")],
+            [InlineKeyboardButton(text="💾 Скачать бэкап базы вручную", callback_data="adm_backup_now")],
             [InlineKeyboardButton(text="🔌 Проверить живые модели API", callback_data="adm_check_api")],
             [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_cats")],
         ]
@@ -945,6 +969,68 @@ def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     )
 
 
+# ================= АДМИН: ВЫБОР МОДЕЛИ ДЛЯ ГЕНЕРАЦИИ КАРТИНОК =================
+async def render_img_model_menu() -> tuple[str, InlineKeyboardMarkup]:
+    current_img = await get_image_model()
+    buttons = []
+    for m_id in IMAGE_MODEL_PRESETS:
+        check = "✅ " if m_id == current_img else ""
+        buttons.append([InlineKeyboardButton(text=f"{check}{m_id}", callback_data=f"adm_set_img_m:{m_id}")])
+
+    buttons.append([InlineKeyboardButton(text="✏️ Ввести свой ID модели вручную", callback_data="adm_set_img_m_custom")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")])
+
+    text = (
+        "🎨 <b>Выбор модели для генерации картинок</b>\n\n"
+        f"Активная модель сейчас: <code>{current_img}</code>\n\n"
+        "Нажми на нужную модель, чтобы переключить бота и протестировать расход токенов на сайте UnlockAPI:"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "adm_img_model_menu")
+async def cb_adm_img_model_menu(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    text, kb = await render_img_model_menu()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_set_img_m:"))
+async def cb_adm_set_img_m(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    new_model = call.data.split(":", 1)[1]
+    await set_image_model(new_model)
+    await call.answer(f"✅ Модель картинок: {new_model}")
+    text, kb = await render_img_model_menu()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "adm_set_img_m_custom")
+async def cb_adm_set_img_m_custom(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE[ADMIN_ID] = "set_img_model_custom"
+    current_img = await get_image_model()
+    await call.message.edit_text(
+        "✏️ <b>Свой ID модели для генерации картинок</b>\n\n"
+        f"Сейчас стоит: <code>{current_img}</code>\n\n"
+        "Отправь точное название модели с сайта UnlockAPI:",
+        reply_markup=admin_cancel_kb("adm_img_model_menu"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
 # ================= ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ =================
 @router.callback_query(F.data == "gen_image")
 async def cb_gen_image(call: CallbackQuery, bot: Bot):
@@ -955,7 +1041,7 @@ async def cb_gen_image(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         "🎨 <b>Генерация изображений</b>\n\n"
         "Опиши текстом, что нужно нарисовать (например: <i>«Киберпанк-город ночью под неоновым дождём, детализация 4k»</i>).\n\n"
-        f"⚡ Стоимость: <b>{IMAGE_GEN_COST} запросов</b> (по подписке PRO — безлимит).",
+        f"⚡ Стоимость: <b>{IMAGE_GEN_COST} запросов</b> (по подписке PRO — до <b>{PRO_DAILY_IMAGE_LIMIT} фото в день</b>).",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
         ),
@@ -973,7 +1059,7 @@ async def cmd_img(message: Message, bot: Bot):
     if len(parts) < 2 or not parts[1].strip():
         USER_INPUT_STATE[message.from_user.id] = "await_image_prompt"
         await message.answer(
-            f"🎨 Отправь описание картинки одним сообщением (стоимость: <b>{IMAGE_GEN_COST} запросов</b>):",
+            f"🎨 Отправь описание картинки одним сообщением (стоимость: <b>{IMAGE_GEN_COST} запросов</b>, по PRO — до <b>{PRO_DAILY_IMAGE_LIMIT}/день</b>):",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
             ),
@@ -984,15 +1070,22 @@ async def cmd_img(message: Message, bot: Bot):
 
 
 async def generate_image_bytes(prompt: str) -> bytes:
+    active_model = await get_image_model()
+    candidates = [active_model] + [m for m in IMAGE_MODEL_PRESETS if m != active_model]
+
     last_error = None
-    for model_name in IMAGE_MODELS:
+    for model_name in candidates:
         try:
-            resp = await ai_client.images.generate(
-                model=model_name,
-                prompt=prompt,
-                n=1,
-                size="1024x1024",
-            )
+            kwargs = {
+                "model": model_name,
+                "prompt": prompt,
+                "n": 1,
+                "size": "1024x1024",
+            }
+            if "gpt-image" in model_name:
+                kwargs["quality"] = "low"
+
+            resp = await ai_client.images.generate(**kwargs)
             item = resp.data[0]
             if getattr(item, "b64_json", None):
                 return base64.b64decode(item.b64_json)
@@ -1014,37 +1107,65 @@ async def run_image_generation(message: Message, prompt: str):
     user_id = message.from_user.id
     user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     pro_active = is_pro(user)
+    images_today = user.get("images_today") or 0
 
-    quota_receipt = await try_consume_quota(user_id, pro_active, count=IMAGE_GEN_COST)
-    if not quota_receipt:
-        disc = has_active_discount(user)
-        await message.answer(
-            f"⏳ Для генерации картинки нужно <b>{IMAGE_GEN_COST} запросов</b>, но твой баланс исчерпан.\n"
-            "Пригласи друга (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    use_pro_quota = False
+    if pro_active and images_today < PRO_DAILY_IMAGE_LIMIT:
+        use_pro_quota = True
+
+    if use_pro_quota:
+        quota_receipt = {"pro": True, "daily": 0, "extra": 0}
+    else:
+        quota_receipt = await try_consume_quota(user_id, pro_active=False, count=IMAGE_GEN_COST)
+        if not quota_receipt:
+            disc = has_active_discount(user)
+            if pro_active:
+                await message.answer(
+                    f"⏳ <b>Дневной лимит PRO-генераций исчерпан ({PRO_DAILY_IMAGE_LIMIT}/{PRO_DAILY_IMAGE_LIMIT} за сегодня).</b>\n"
+                    f"Лимит обновится завтра, либо ты можешь докупить пакет запросов ({IMAGE_GEN_COST} запр. за картинку):",
+                    reply_markup=shop_kb(disc),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await message.answer(
+                    f"⏳ Для генерации картинки нужно <b>{IMAGE_GEN_COST} запросов</b>.\n"
+                    f"Оформи <b>PRO-подписку</b> (до {PRO_DAILY_IMAGE_LIMIT} картинок в день) или возьми пакет запросов:",
+                    reply_markup=shop_kb(disc),
+                    parse_mode=ParseMode.HTML,
+                )
+            return
 
     wait_msg = await message.answer("🎨 <i>Генерирую изображение...</i>", parse_mode=ParseMode.HTML)
     try:
         img_bytes = await generate_image_bytes(prompt)
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
-                (IMAGE_GEN_COST, user_id),
-            )
+            if use_pro_quota:
+                await db.execute(
+                    "UPDATE users SET images_today = images_today + 1, total_requests = total_requests + ? WHERE user_id = ?",
+                    (IMAGE_GEN_COST, user_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
+                    (IMAGE_GEN_COST, user_id),
+                )
             await db.commit()
 
         await wait_msg.delete()
         photo_file = BufferedInputFile(img_bytes, filename="generated.png")
+        left_info = (
+            f"\n<i>Осталось сегодня по PRO: {PRO_DAILY_IMAGE_LIMIT - (images_today + 1)}/{PRO_DAILY_IMAGE_LIMIT}</i>"
+            if use_pro_quota
+            else ""
+        )
         await message.answer_photo(
             photo=photo_file,
-            caption=f"🎨 <b>Готово!</b>\n<i>Запрос: {html.escape(prompt[:200])}</i>",
+            caption=f"🎨 <b>Готово!</b>\n<i>Запрос: {html.escape(prompt[:200])}</i>{left_info}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        await refund_quota(user_id, quota_receipt)
+        if not use_pro_quota:
+            await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
             f"⚠️ <b>Не удалось сгенерировать картинку:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
@@ -1247,7 +1368,6 @@ async def handle_document(message: Message, bot: Bot):
     fname = document.file_name or ""
     ext = os.path.splitext(fname.lower())[1]
 
-    # 1. Восстановление базы данных администратором
     if user_id == ADMIN_ID and ext in (".db", ".sqlite", ".sqlite3"):
         try:
             file_info = await bot.get_file(document.file_id)
@@ -1270,7 +1390,6 @@ async def handle_document(message: Message, bot: Bot):
             await message.answer(f"❌ <b>Ошибка восстановления:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
         return
 
-    # 2. Решение задач по текстовым файлам и файлам с кодом
     if ext not in TEXT_FILE_EXTS:
         await message.answer(
             "⚠️ Поддерживаются текстовые файлы и исходный код (<code>.txt</code>, <code>.py</code>, <code>.js</code>, <code>.html</code>, <code>.csv</code>, <code>.json</code>, <code>.md</code>, <code>.sql</code> и др.).",
@@ -1482,6 +1601,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
 
     total_daily = FREE_DAILY_LIMIT + user["bonus_limit"]
     left_today = max(0, total_daily - user["used_today"])
+    imgs_today = user.get("images_today") or 0
     uname_str = f" (@{user['username']})" if user.get("username") else ""
     joined_str = (
         datetime.fromtimestamp(user["joined_at"]).strftime("%d.%m.%Y %H:%M")
@@ -1531,6 +1651,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"🏷 Скидка 50%: {disc_str}\n"
         f"🤖 Модель: <b>{cur_model}</b>\n"
         f"⚡ Запросы сегодня: <b>{user['used_today']}/{total_daily}</b> (осталось {left_today})\n"
+        f"🎨 Картинок сегодня по PRO: <b>{imgs_today}/{PRO_DAILY_IMAGE_LIMIT}</b>\n"
         f"📦 Запросы из пакета: <b>{user.get('extra_requests', 0)} шт.</b>\n"
         f"🎁 Бонус к дневному лимиту: <b>+{user['bonus_limit']} в день</b>\n"
         f"📊 Всего запросов за всё время: <b>{user.get('total_requests', 0)}</b>\n\n"
@@ -1773,9 +1894,9 @@ async def cb_adm_u_resetday(call: CallbackQuery):
     _, uid_s, page_s = call.data.split(":")
     target_id, page = int(uid_s), int(page_s)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET used_today = 0 WHERE user_id = ?", (target_id,))
+        await db.execute("UPDATE users SET used_today = 0, images_today = 0 WHERE user_id = ?", (target_id,))
         await db.commit()
-    await call.answer("🔄 Дневной счётчик запросов обнулён")
+    await call.answer("🔄 Дневной счётчик запросов и картинок обнулён")
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -1888,6 +2009,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
     total_limit = FREE_DAILY_LIMIT + user["bonus_limit"]
     left = max(0, total_limit - user["used_today"])
     extra = user.get("extra_requests", 0)
+    imgs_today = user.get("images_today") or 0
 
     if pro_active:
         if user["pro_until"] > time.time() + 365 * 5 * 86400:
@@ -1895,7 +2017,10 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         else:
             exp_str = datetime.fromtimestamp(user["pro_until"]).strftime("%d.%m.%Y %H:%M")
             sub_block = f"👑 Подписка: <b>Активна (до {exp_str})</b>"
-        req_block = f"⚡ Дневные запросы: <b>Безлимит</b> (сегодня: {user['used_today']})"
+        req_block = (
+            f"⚡ Текст и разбор фото: <b>Безлимит</b>\n"
+            f"🎨 Генерация фото по PRO: <b>осталось {max(0, PRO_DAILY_IMAGE_LIMIT - imgs_today)} из {PRO_DAILY_IMAGE_LIMIT} сегодня</b>"
+        )
     else:
         sub_block = "🆓 Подписка: <b>Не активна (Бесплатный тариф)</b>"
         req_block = (
@@ -2003,6 +2128,7 @@ async def redeem_promocode(user_id: int, raw_code: str) -> tuple[bool, str]:
 async def render_admin_text() -> str:
     today_str = str(date.today())
     engine = await get_engine_model()
+    img_model = await get_image_model()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             total_users = (await cur.fetchone())[0]
@@ -2018,7 +2144,8 @@ async def render_admin_text() -> str:
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
         f"⚙️ Общий движок (текст): <code>{engine}</code>\n"
-        f"📸 Движок для фото: <code>{VISION_MODEL}</code> (сжатие 1024px)\n"
+        f"🎨 Модель генерации фото: <code>{img_model}</code> (лимит PRO: {PRO_DAILY_IMAGE_LIMIT}/день)\n"
+        f"📸 Движок разбора фото: <code>{VISION_MODEL}</code> (сжатие 1024px)\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
         f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
@@ -2580,7 +2707,7 @@ async def cb_buy(call: CallbackQuery):
     final_price = get_product_price(product, disc)
 
     if product["type"] == "sub":
-        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
+        desc = f"Безлимит на модели + до {PRO_DAILY_IMAGE_LIMIT} фото/день на {product['value']} дн."
     else:
         desc = f"Пакет на {product['value']} дополнительных запросов."
 
@@ -2680,7 +2807,6 @@ async def generate_text_response(user_id: int, selected_model: str, history: lis
 
 
 async def generate_photos_response(caption: str, b64_images: list[str]) -> str:
-    # Используем лёгкую vision-модель, чтобы расход токенов на фото был минимальным
     seen = set()
     candidates = []
     for m in VISION_FALLBACK_MODELS:
@@ -2775,7 +2901,6 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         for msg in messages:
             if msg.caption and not caption:
                 caption = msg.caption
-            # Берём среднее разрешение (обычно 800px) вместо максимального 2560px и дополнительно сжимаем до 1024px
             photo = msg.photo[-2] if len(msg.photo) >= 2 and msg.photo[-2].width >= 750 else msg.photo[-1]
             file_info = await bot.get_file(photo.file_id)
             downloaded = await bot.download_file(file_info.file_path)
@@ -2872,7 +2997,16 @@ async def handle_prompt(message: Message, bot: Bot):
     if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
         action = USER_INPUT_STATE.pop(ADMIN_ID)
 
-        if action == "adm_broadcast_msg":
+        if action == "set_img_model_custom":
+            if not text_in or " " in text_in:
+                await message.answer("⚠️ Введи корректный ID модели без пробелов.", reply_markup=await admin_kb())
+                return
+            await set_image_model(text_in)
+            text, kb = await render_img_model_menu()
+            await message.answer(f"✅ Модель картинок изменена на <code>{text_in}</code>\n\n{text}", reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action == "adm_broadcast_msg":
             BROADCAST_DRAFT["chat_id"] = message.chat.id
             BROADCAST_DRAFT["message_id"] = message.message_id
             kb = InlineKeyboardMarkup(
