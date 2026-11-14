@@ -2078,15 +2078,15 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
             return
         me = await bot.get_me()
         bot_username = me.username or "AetherNeural_bot"
-        ref_link = f"https://t.me/{bot_username}?start={call.from_user.id}"
+        base_tg = "https" + "://" + "t.me"
+        ref_link = f"{base_tg}/{bot_username}?start={call.from_user.id}"
         share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
-        share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={share_text}"
+        share_url = f"{base_tg}/share/url?url={quote(ref_link)}&text={share_text}"
 
         buttons = [
             [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
         ]
 
-        # Добавляем кнопку копирования в 1 клик, если версия aiogram поддерживает CopyTextButton
         try:
             from aiogram.types import CopyTextButton
             buttons.append([
@@ -2106,7 +2106,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
             f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
             f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
             f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
-            f"🔗 Твоя ссылка:\n{ref_link}",
+            f"🔗 Твоя ссылка:\n<code>{ref_link}</code>",
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
