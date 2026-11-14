@@ -1855,13 +1855,21 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     me = await bot.get_me()
-    ref_link = f"[https://t.me/](https://t.me/){me.username}?start={call.from_user.id}"
+    ref_link = "https://" + f"t.me/{me.username}?start={call.from_user.id}"
+    share_url = f"https://t.me/share/url?url={ref_link}&text=Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
+        ]
+    )
     await call.message.answer(
         f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
         f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
         f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
         f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
-        f"🔗 Твоя ссылка:\n<code>{ref_link}</code>",
+        f"🔗 Твоя ссылка (нажми, чтобы скопировать):\n<code>{ref_link}</code>",
+        reply_markup=kb,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
