@@ -55,17 +55,9 @@ FALLBACK_MODELS = [
     "claude-haiku-5-5",
 ]
 
-EMOJI_IDS = {
-    "gemini": "5321197740800120767",
-    "gpt": "5310259124817134249",
-    "claude": "5321196473784773037",
-    "grok": "5319288443153445517",
-    "deepseek": "5456541677944612102",
-}
-
 CATEGORIES = {
     "gpt": {
-        "title": "GPT (OpenAI)",
+        "title": "🤖 GPT (OpenAI)",
         "models": [
             {"id": "gpt-6-luna", "name": "GPT-6 Luna", "pro": False, "tag": "FREE"},
             {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "pro": False, "tag": "FREE"},
@@ -79,7 +71,7 @@ CATEGORIES = {
         ],
     },
     "claude": {
-        "title": "Claude (Anthropic)",
+        "title": "🧠 Claude (Anthropic)",
         "models": [
             {"id": "claude-haiku-5-5", "name": "Claude Haiku 5.5", "pro": False, "tag": "FREE"},
             {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "pro": True, "tag": "PRO"},
@@ -90,7 +82,7 @@ CATEGORIES = {
         ],
     },
     "gemini": {
-        "title": "Gemini (Google)",
+        "title": "✨ Gemini (Google)",
         "models": [
             {"id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite", "pro": False, "tag": "FREE"},
             {"id": "gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "pro": False, "tag": "FREE"},
@@ -100,14 +92,14 @@ CATEGORIES = {
         ],
     },
     "deepseek": {
-        "title": "DeepSeek",
+        "title": "🐋 DeepSeek",
         "models": [
             {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash", "pro": False, "tag": "FREE"},
             {"id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "pro": True, "tag": "PRO"},
         ],
     },
     "grok": {
-        "title": "Grok (xAI)",
+        "title": "⚡ Grok (xAI)",
         "models": [
             {"id": "grok-4.5", "name": "Grok 4.5", "pro": True, "tag": "PRO"},
             {"id": "grok-4.6", "name": "Grok 4.6", "pro": True, "tag": "PRO"},
@@ -140,13 +132,15 @@ SYSTEM_PROMPT = (
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
-    timeout=35.0,
+    timeout=45.0,
     max_retries=0,
 )
 router = Router()
 
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
+# Буфер для склейки альбомов (нескольких фото за раз)
+MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
 
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
@@ -415,7 +409,7 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
 
 
 async def try_consume_quota(user_id: int, pro_active: bool) -> str | None:
-    """Атомарно резервирует 1 запрос ДО начала генерации, чтобы параллельные сообщения не обходили лимит."""
+    """Атомарно резервирует 1 запрос ДО начала генерации."""
     if pro_active:
         return "pro"
     async with aiosqlite.connect(DB_PATH) as db:
@@ -657,15 +651,15 @@ def format_status(user: dict) -> str:
 def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton(text="GPT", callback_data="cat:gpt", icon_custom_emoji_id=EMOJI_IDS["gpt"]),
-            InlineKeyboardButton(text="Claude", callback_data="cat:claude", icon_custom_emoji_id=EMOJI_IDS["claude"]),
+            InlineKeyboardButton(text="🤖 GPT", callback_data="cat:gpt"),
+            InlineKeyboardButton(text="🧠 Claude", callback_data="cat:claude"),
         ],
         [
-            InlineKeyboardButton(text="Gemini", callback_data="cat:gemini", icon_custom_emoji_id=EMOJI_IDS["gemini"]),
-            InlineKeyboardButton(text="DeepSeek", callback_data="cat:deepseek", icon_custom_emoji_id=EMOJI_IDS["deepseek"]),
+            InlineKeyboardButton(text="✨ Gemini", callback_data="cat:gemini"),
+            InlineKeyboardButton(text="🐋 DeepSeek", callback_data="cat:deepseek"),
         ],
         [
-            InlineKeyboardButton(text="Grok", callback_data="cat:grok", icon_custom_emoji_id=EMOJI_IDS["grok"]),
+            InlineKeyboardButton(text="⚡ Grok", callback_data="cat:grok"),
             InlineKeyboardButton(text="⭐ Подписка / Пакеты", callback_data="shop"),
         ],
         [
@@ -1733,7 +1727,7 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото задачи.\n\n"
+        f"Выбери раздел ниже, чтобы переключить нейросеть, или просто отправь текст / фото (можно сразу до 10 фото альбомом).\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
         f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
@@ -1967,7 +1961,7 @@ async def successful_payment(message: Message):
             )
 
 
-# ================= ГЕНЕРАЦИЯ (ДЛЯ АДМИНА — ВЫБРАННАЯ МОДЕЛЬ, ДЛЯ ЮЗЕРОВ — ENGINE_MODEL) =================
+# ================= ГЕНЕРАЦИЯ (ТЕКСТ И ПАКЕТ ФОТОГРАФИЙ) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
     if user_id == ADMIN_ID and selected_model:
         return [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
@@ -2002,18 +1996,18 @@ async def generate_text_response(user_id: int, selected_model: str, history: lis
     raise last_error or RuntimeError("Все модели временно недоступны")
 
 
-async def generate_photo_response(user_id: int, selected_model: str, caption: str, b64_img: str) -> str:
+async def generate_photos_response(user_id: int, selected_model: str, caption: str, b64_images: list[str]) -> str:
     candidates = await get_candidates_for_user(user_id, selected_model)
+
+    user_content: list[dict] = [{"type": "text", "text": caption}]
+    for b64_img in b64_images:
+        user_content.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+        )
 
     messages_payload = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": caption},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
-            ],
-        },
+        {"role": "user", "content": user_content},
     ]
 
     last_error = None
@@ -2022,7 +2016,7 @@ async def generate_photo_response(user_id: int, selected_model: str, caption: st
             response = await ai_client.chat.completions.create(
                 model=candidate_id,
                 messages=messages_payload,
-                max_tokens=1500,
+                max_tokens=2000,
             )
             content = response.choices[0].message.content
             if content:
@@ -2034,43 +2028,63 @@ async def generate_photo_response(user_id: int, selected_model: str, caption: st
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ФОТОГРАФИЙ =================
-@router.message(F.photo)
-async def handle_photo(message: Message, bot: Bot):
-    user_id = message.from_user.id
-    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-    if not await ensure_subscribed(bot, user_id, message):
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (ДО 10 ФОТО ЗА РАЗ) =================
+async def process_photo_batch(messages: list[Message], bot: Bot):
+    first_msg = messages[0]
+    user_id = first_msg.from_user.id
+    user = await get_user(
+        user_id,
+        full_name=first_msg.from_user.full_name,
+        username=first_msg.from_user.username or "",
+    )
+    if not await ensure_subscribed(bot, user_id, first_msg):
         return
 
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
     quota_source = await try_consume_quota(user_id, pro_active)
     if not quota_source:
         disc = has_active_discount(user)
-        await message.answer(
+        await first_msg.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
             "Оформи подписку или возьми пакет запросов:",
             reply_markup=shop_kb(disc),
         )
         return
 
+    count = len(messages)
     shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
-    wait_msg = await message.answer(f"📸 <i>Анализирую изображение ({shown_model})...</i>", parse_mode=ParseMode.HTML)
+    status_label = (
+        f"📸 <i>Анализирую {count} фото ({shown_model})...</i>"
+        if count > 1
+        else f"📸 <i>Анализирую изображение ({shown_model})...</i>"
+    )
+    wait_msg = await first_msg.answer(status_label, parse_mode=ParseMode.HTML)
 
     try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        downloaded = await bot.download_file(file_info.file_path)
-        b64_img = base64.b64encode(downloaded.read()).decode("utf-8")
+        b64_list: list[str] = []
+        caption = ""
+        for msg in messages:
+            if msg.caption and not caption:
+                caption = msg.caption
+            photo = msg.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            downloaded = await bot.download_file(file_info.file_path)
+            b64_list.append(base64.b64encode(downloaded.read()).decode("utf-8"))
 
-        caption = message.caption or "Подробно разбери и реши то, что изображено на фото."
-        answer_text = await generate_photo_response(
+        if not caption:
+            if count > 1:
+                caption = f"Подробно разбери и реши все задания с этих {count} фотографий по порядку, объединив ответ в один структурированный текст."
+            else:
+                caption = "Подробно разбери и реши то, что изображено на фото."
+
+        answer_text = await generate_photos_response(
             user_id=user_id,
             selected_model=user["selected_model"],
             caption=caption,
-            b64_img=b64_img,
+            b64_images=b64_list,
         )
 
-        await add_history(user_id, "user", f"[Отправил фото с подписью: {caption}]")
+        await add_history(user_id, "user", f"[Отправил {count} фото с подписью: {caption}]")
         await add_history(user_id, "assistant", answer_text)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2078,9 +2092,9 @@ async def handle_photo(message: Message, bot: Bot):
             await db.commit()
 
         await wait_msg.delete()
-        await send_formatted_answer(message, answer_text)
+        await send_formatted_answer(first_msg, answer_text)
 
-        await check_and_send_discount_offer(user_id, message)
+        await check_and_send_discount_offer(user_id, first_msg)
 
     except Exception as e:
         await refund_quota(user_id, quota_source)
@@ -2088,6 +2102,23 @@ async def handle_photo(message: Message, bot: Bot):
             f"⚠️ <b>Не удалось распознать фото:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
         )
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot):
+    mg_id = message.media_group_id
+    if mg_id:
+        is_first = mg_id not in MEDIA_GROUP_BUFFER
+        MEDIA_GROUP_BUFFER.setdefault(mg_id, []).append(message)
+        if is_first:
+            # Ждём 1.3 секунды, чтобы Telegram успел прислать все 2-10 фото из альбома
+            await asyncio.sleep(1.3)
+            batch = MEDIA_GROUP_BUFFER.pop(mg_id, [])
+            if batch:
+                batch.sort(key=lambda m: m.message_id)
+                await process_photo_batch(batch, bot)
+    else:
+        await process_photo_batch([message], bot)
 
 
 # ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
