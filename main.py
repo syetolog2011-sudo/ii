@@ -8,6 +8,7 @@ import shutil
 import string
 import time
 from datetime import date, datetime
+from urllib.parse import quote
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
@@ -19,6 +20,7 @@ from aiogram.types import (
     LabeledPrice,
     PreCheckoutQuery,
     BotCommand,
+    FSInputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -217,8 +219,12 @@ def get_product_price(product: dict, discount_active: bool) -> int:
     return base
 
 
-# ================= БАЗА ДАННЫХ (С АВТОБЭКАПОМ ПЕРЕД СТАРТОМ) =================
+# ================= БАЗА ДАННЫХ И TELEGRAM-БЭКАПЫ =================
 async def init_db():
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         try:
             shutil.copy2(DB_PATH, f"{DB_PATH}.bak")
@@ -270,7 +276,6 @@ async def init_db():
             "UPDATE users SET first_seen_at = COALESCE(NULLIF(joined_at, 0), ?) WHERE first_seen_at = 0 OR first_seen_at IS NULL",
             (time.time(),),
         )
-        # Нормализуем возможные старые значения used_today, если где-то превышали лимит
         await db.execute(
             "UPDATE users SET used_today = (? + bonus_limit) WHERE used_today > (? + bonus_limit)",
             (FREE_DAILY_LIMIT, FREE_DAILY_LIMIT),
@@ -333,6 +338,37 @@ async def init_db():
             (current_week_key(),),
         )
         await db.commit()
+
+
+async def send_db_backup(bot: Bot, reason: str = "Автобэкап"):
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                    total_u = (await cur.fetchone())[0]
+                async with db.execute("SELECT COUNT(*) FROM users WHERE pro_until > ?", (time.time(),)) as cur:
+                    pro_u = (await cur.fetchone())[0]
+
+            file = FSInputFile(DB_PATH, filename="users.db")
+            await bot.send_document(
+                ADMIN_ID,
+                document=file,
+                caption=(
+                    f"💾 <b>{reason} базы данных</b> ({datetime.now().strftime('%d.%m.%Y %H:%M')})\n"
+                    f"👥 Пользователей: <b>{total_u}</b> | 👑 PRO: <b>{pro_u}</b>\n\n"
+                    f"<i>Если после перезапуска хостинга база сбросится — просто перешли этот файл мне в личку.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print(f"Ошибка отправки бэкапа: {e}")
+
+
+async def auto_backup_watcher(bot: Bot):
+    await asyncio.sleep(120)
+    while True:
+        await send_db_backup(bot, reason="Автобэкап")
+        await asyncio.sleep(3 * 3600)
 
 
 async def get_setting(key: str, default: str = "") -> str:
@@ -443,12 +479,6 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
 
 
 async def try_consume_quota(user_id: int, pro_active: bool, count: int = 1) -> dict | None:
-    """
-    Атомарно (под блокировкой пользователя) проверяет и списывает ровно `count` запросов:
-    сначала из дневного лимита (никогда не превышая FREE_DAILY_LIMIT + bonus_limit),
-    остаток — из пакета extra_requests.
-    Возвращает словарь списания {"pro": bool, "daily": int, "extra": int} или None, если не хватает.
-    """
     if pro_active:
         return {"pro": True, "daily": 0, "extra": 0}
 
@@ -836,6 +866,7 @@ async def admin_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
+            [InlineKeyboardButton(text="💾 Скачать бэкап базы (users.db)", callback_data="adm_backup_now")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
             [InlineKeyboardButton(text=f"⚙️ Общий движок (для юзеров): {engine}", callback_data="adm_set_engine")],
@@ -851,6 +882,42 @@ def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
     )
+
+
+# ================= ВОССТАНОВЛЕНИЕ И РУЧНОЙ БЭКАП БАЗЫ ДАННЫХ =================
+@router.callback_query(F.data == "adm_backup_now")
+async def cb_adm_backup_now(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.answer("💾 Формирую файл базы...")
+    await send_db_backup(bot, reason="Ручной бэкап")
+
+
+@router.message(F.document)
+async def handle_db_upload(message: Message, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+    document = message.document
+    if document.file_name and document.file_name.endswith(".db"):
+        try:
+            file_info = await bot.get_file(document.file_id)
+            bytes_file = await bot.download_file(file_info.file_path)
+
+            db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+
+            with open(DB_PATH, "wb") as f:
+                f.write(bytes_file.read())
+
+            await init_db()
+            await message.answer(
+                "✅ <b>База данных успешно восстановлена из файла!</b>\n"
+                "Все подписки, пакеты и пользователи на месте.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            await message.answer(f"❌ <b>Ошибка восстановления:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
 
 
 # ================= АДМИН: РАССЫЛКА ПО БАЗЕ =================
@@ -1127,6 +1194,7 @@ async def cb_adm_u_pro(call: CallbackQuery, bot: Bot):
         pass
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
 
 
 @router.callback_query(F.data.startswith("adm_u_pro_cust:"))
@@ -1160,6 +1228,7 @@ async def cb_adm_u_req(call: CallbackQuery, bot: Bot):
         pass
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    asyncio.create_task(send_db_backup(bot, reason=f"Начисление запросов ({target_id})"))
 
 
 @router.callback_query(F.data.startswith("adm_u_req_cust:"))
@@ -1836,6 +1905,7 @@ async def cmd_givepro(message: Message, bot: Bot):
         await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
     except Exception:
         pass
+    asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
 
 
 @router.message(Command("delpro"))
@@ -2009,12 +2079,21 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         me = await bot.get_me()
         bot_username = me.username or "AetherNeural_bot"
         ref_link = f"[https://t.me/](https://t.me/){bot_username}?start={call.from_user.id}"
+        share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
+        share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){quote(ref_link)}&text={share_text}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
+            ]
+        )
         await call.message.answer(
             f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
             f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
             f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
             f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
             f"🔗 Твоя ссылка (нажми, чтобы скопировать):\n<code>{ref_link}</code>",
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -2071,7 +2150,7 @@ async def pre_checkout(query: PreCheckoutQuery):
 
 
 @router.message(F.successful_payment)
-async def successful_payment(message: Message):
+async def successful_payment(message: Message, bot: Bot):
     payload = message.successful_payment.invoice_payload
     prod_key = payload.split(":", 1)[1]
     product = PRODUCTS[prod_key]
@@ -2113,6 +2192,8 @@ async def successful_payment(message: Message):
                 f"Проверить остаток можно в /profile.",
                 parse_mode=ParseMode.HTML,
             )
+
+    asyncio.create_task(send_db_backup(bot, reason=f"Покупка ({message.from_user.id}, {paid_stars}⭐)"))
 
 
 # ================= ГЕНЕРАЦИЯ (ТЕКСТ И ПАКЕТ ФОТОГРАФИЙ) =================
@@ -2373,6 +2454,7 @@ async def handle_prompt(message: Message, bot: Bot):
                 pass
             text, kb = await render_user_card(target_id, page)
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            asyncio.create_task(send_db_backup(bot, reason=f"Выдача PRO ({target_id})"))
             return
 
         elif action.startswith("adm_u_req_cust:"):
@@ -2392,6 +2474,7 @@ async def handle_prompt(message: Message, bot: Bot):
                 pass
             text, kb = await render_user_card(target_id, page)
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            asyncio.create_task(send_db_backup(bot, reason=f"Начисление запросов ({target_id})"))
             return
 
         elif action.startswith("adm_u_subreq_cust:"):
@@ -2530,6 +2613,7 @@ async def main():
     await setup_bot_commands(bot)
     asyncio.create_task(weekly_leaderboard_watcher(bot))
     asyncio.create_task(delayed_discount_watcher(bot))
+    asyncio.create_task(auto_backup_watcher(bot))
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен!")
