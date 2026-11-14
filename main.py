@@ -2078,21 +2078,35 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
             return
         me = await bot.get_me()
         bot_username = me.username or "AetherNeural_bot"
-        ref_link = f"[https://t.me/](https://t.me/){bot_username}?start={call.from_user.id}"
+        ref_link = f"https://t.me/{bot_username}?start={call.from_user.id}"
         share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
-        share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){quote(ref_link)}&text={share_text}"
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
-                [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
-            ]
-        )
+        share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={share_text}"
+
+        buttons = [
+            [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
+        ]
+
+        # Добавляем кнопку копирования в 1 клик, если версия aiogram поддерживает CopyTextButton
+        try:
+            from aiogram.types import CopyTextButton
+            buttons.append([
+                InlineKeyboardButton(
+                    text="📋 Скопировать ссылку",
+                    copy_text=CopyTextButton(text=ref_link),
+                )
+            ])
+        except Exception:
+            pass
+
+        buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
         await call.message.answer(
             f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
             f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
             f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
             f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
-            f"🔗 Твоя ссылка (нажми, чтобы скопировать):\n<code>{ref_link}</code>",
+            f"🔗 Твоя ссылка:\n{ref_link}",
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
