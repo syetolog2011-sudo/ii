@@ -45,6 +45,9 @@ MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 USERS_PER_PAGE = 8
 
+DISCOUNT_DELAY_SECONDS = 2 * 3600      # Через 2 часа после первого сообщения
+DISCOUNT_DURATION_SECONDS = 36 * 3600  # Скидка действует 36 часов
+
 FALLBACK_MODELS = [
     "gpt-6-luna",
     "gpt-5.6-luna",
@@ -195,7 +198,7 @@ def current_week_key() -> str:
 
 
 def has_active_discount(user: dict) -> bool:
-    return user.get("discount_until", 0) > time.time()
+    return (user.get("discount_until") or 0) > time.time()
 
 
 def get_product_price(product: dict, discount_active: bool) -> int:
@@ -225,7 +228,8 @@ async def init_db():
                 visited_models INTEGER DEFAULT 0,
                 discount_until REAL DEFAULT 0,
                 discount_offered INTEGER DEFAULT 0,
-                joined_at REAL DEFAULT 0
+                joined_at REAL DEFAULT 0,
+                first_seen_at REAL DEFAULT 0
             )
         """)
 
@@ -239,12 +243,19 @@ async def init_db():
             ("discount_until", "REAL DEFAULT 0"),
             ("discount_offered", "INTEGER DEFAULT 0"),
             ("joined_at", "REAL DEFAULT 0"),
+            ("first_seen_at", "REAL DEFAULT 0"),
         ]
         for col_name, col_def in new_cols:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
             except Exception:
                 pass
+
+        # Заполняем first_seen_at для старых пользователей без этого поля
+        await db.execute(
+            "UPDATE users SET first_seen_at = COALESCE(NULLIF(joined_at, 0), ?) WHERE first_seen_at = 0 OR first_seen_at IS NULL",
+            (time.time(),),
+        )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS payments (
@@ -363,6 +374,7 @@ async def clear_history(user_id: int):
 
 async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username: str = "") -> dict:
     today_str = str(date.today())
+    now = time.time()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
@@ -374,10 +386,10 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
             clean_uname = (username or "")[:40]
             await db.execute(
                 """
-                INSERT INTO users (user_id, full_name, username, last_reset, referred_by, ref_rewarded, joined_at)
-                VALUES (?, ?, ?, ?, ?, 0, ?)
+                INSERT INTO users (user_id, full_name, username, last_reset, referred_by, ref_rewarded, joined_at, first_seen_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
                 """,
-                (user_id, clean_name, clean_uname, today_str, valid_ref, time.time()),
+                (user_id, clean_name, clean_uname, today_str, valid_ref, now, now),
             )
             await db.commit()
             return await get_user(user_id)
@@ -390,6 +402,10 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
             params.append(today_str)
             user["used_today"] = 0
             user["last_reset"] = today_str
+        if not user.get("first_seen_at"):
+            updates.append("first_seen_at = ?")
+            params.append(now)
+            user["first_seen_at"] = now
         if full_name and user.get("full_name") != full_name[:40]:
             updates.append("full_name = ?")
             params.append(full_name[:40])
@@ -482,6 +498,70 @@ async def reward_referrer_if_needed(user_id: int, bot: Bot):
                 pass
 
 
+# ================= ФОНОВЫЙ ПЛАНИРОВЩИК: СКИДКА 50% НА 36 ЧАСОВ ЧЕРЕЗ 2 ЧАСА =================
+async def delayed_discount_watcher(bot: Bot):
+    """
+    Через 2 часа после первого сообщения боту автоматически активирует пользователю
+    скидку 50% на 36 часов, применяет её к ценам и отправляет уведомление.
+    """
+    while True:
+        try:
+            now = time.time()
+            cutoff = now - DISCOUNT_DELAY_SECONDS
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """
+                    SELECT user_id FROM users
+                    WHERE discount_offered = 0
+                      AND first_seen_at > 0
+                      AND first_seen_at <= ?
+                      AND pro_until <= ?
+                      AND user_id != ?
+                    """,
+                    (cutoff, now, ADMIN_ID),
+                ) as cur:
+                    eligible_users = await cur.fetchall()
+
+                for row in eligible_users:
+                    uid = row["user_id"]
+                    disc_until = now + DISCOUNT_DURATION_SECONDS
+                    await db.execute(
+                        "UPDATE users SET discount_until = ?, discount_offered = 1 WHERE user_id = ?",
+                        (disc_until, uid),
+                    )
+                    await db.commit()
+
+                    offer_text = (
+                        "🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА 50% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
+                        "Мы снизили цены вдвое на все тарифы и пакеты запросов специально для тебя на ближайшие <b>36 часов</b> (скидка уже применена ко всем ценам ниже):\n\n"
+                        "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
+                        f"• Пробный 1 день: <s>59 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_trial'], True)} ⭐</b>\n"
+                        f"• Стандарт 7 дней: <s>149 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_standard'], True)} ⭐</b>\n"
+                        f"• Премиум 30 дней: <s>349 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_premium'], True)} ⭐</b>\n\n"
+                        "⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>\n"
+                        f"• +30 запросов: <s>79 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_30'], True)} ⭐</b>\n"
+                        f"• +100 запросов: <s>199 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_100'], True)} ⭐</b>\n"
+                        f"• +300 запросов: <s>449 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_300'], True)} ⭐</b>\n\n"
+                        "👇 Жми на любой тариф прямо сейчас, пока действует акция:"
+                    )
+                    try:
+                        await bot.send_message(
+                            uid,
+                            offer_text,
+                            reply_markup=shop_kb(discount_active=True),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(0.1)
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 # ================= ЕЖЕНЕДЕЛЬНЫЙ ЛИДЕРБОРД И НАГРАДЫ =================
 async def distribute_weekly_rewards(bot: Bot, week_to_close: str) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -561,38 +641,6 @@ async def weekly_leaderboard_watcher(bot: Bot):
         except Exception:
             pass
         await asyncio.sleep(600)
-
-
-# ================= ТРИГГЕРНАЯ СКИДКА 50% НА 24 ЧАСА =================
-async def check_and_send_discount_offer(user_id: int, message: Message):
-    user = await get_user(user_id)
-    if is_pro(user) or user.get("discount_offered", 0) == 1:
-        return
-
-    if user.get("visited_models", 0) >= 1 and user.get("total_requests", 0) >= 2:
-        disc_until = time.time() + 86400
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET discount_until = ?, discount_offered = 1 WHERE user_id = ?",
-                (disc_until, user_id),
-            )
-            await db.commit()
-
-        user["discount_until"] = disc_until
-        offer_text = (
-            "🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА 50% НА 24 ЧАСА!</b>\n\n"
-            "Мы видим, что тебе зашёл наш ИИ-бот! Специально для тебя мы открыли закрытую распродажу на все тарифы и пакеты запросов ровно на <b>24 часа</b>:\n\n"
-            "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
-            f"• Пробный 1 день: <s>59 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_trial'], True)} ⭐</b>\n"
-            f"• Стандарт 7 дней: <s>149 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_standard'], True)} ⭐</b>\n"
-            f"• Премиум 30 дней: <s>349 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_premium'], True)} ⭐</b>\n\n"
-            "⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>\n"
-            f"• +30 запросов: <s>79 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_30'], True)} ⭐</b>\n"
-            f"• +100 запросов: <s>199 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_100'], True)} ⭐</b>\n"
-            f"• +300 запросов: <s>449 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_300'], True)} ⭐</b>\n\n"
-            "👇 Жми на любой тариф прямо сейчас, пока действует таймер:"
-        )
-        await message.answer(offer_text, reply_markup=shop_kb(discount_active=True), parse_mode=ParseMode.HTML)
 
 
 # ================= ПРОВЕРКА ПОДПИСКИ НА КАНАЛ =================
@@ -827,6 +875,14 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
     else:
         sub_str = "🆓 <b>Не активна</b>"
 
+    if has_active_discount(user):
+        d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
+        disc_str = f"🔥 <b>Активна 50% (до {d_exp})</b>"
+    elif user.get("discount_offered"):
+        disc_str = "⏳ Истекла"
+    else:
+        disc_str = "🕒 Ожидает (через 2ч после старта)"
+
     total_daily = FREE_DAILY_LIMIT + user["bonus_limit"]
     left_today = max(0, total_daily - user["used_today"])
     uname_str = f" (@{user['username']})" if user.get("username") else ""
@@ -875,6 +931,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"📅 В боте с: <b>{joined_str}</b>\n"
         f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n\n"
         f"💎 Подписка: {sub_str}\n"
+        f"🏷 Скидка 50%: {disc_str}\n"
         f"🤖 Модель: <b>{cur_model}</b>\n"
         f"⚡ Запросы сегодня: <b>{user['used_today']}/{total_daily}</b> (осталось {left_today})\n"
         f"📦 Запросы из пакета: <b>{user.get('extra_requests', 0)} шт.</b>\n"
@@ -1856,7 +1913,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         return
     me = await bot.get_me()
     ref_link = "https://" + f"t.me/{me.username}?start={call.from_user.id}"
-    share_url = f"https://t.me/share/url?url={ref_link}&text=Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!"
+    share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){ref_link}&text=Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
@@ -2101,8 +2158,6 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         await wait_msg.delete()
         await send_formatted_answer(first_msg, answer_text)
 
-        await check_and_send_discount_offer(user_id, first_msg)
-
     except Exception as e:
         await refund_quota(user_id, quota_source)
         await wait_msg.edit_text(
@@ -2317,8 +2372,6 @@ async def handle_prompt(message: Message, bot: Bot):
         await wait_msg.delete()
         await send_formatted_answer(message, answer_text)
 
-        await check_and_send_discount_offer(user_id, message)
-
     except Exception as e:
         await refund_quota(user_id, quota_source)
         await wait_msg.edit_text(
@@ -2344,6 +2397,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
     asyncio.create_task(weekly_leaderboard_watcher(bot))
+    asyncio.create_task(delayed_discount_watcher(bot))
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен!")
