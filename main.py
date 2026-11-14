@@ -4,9 +4,11 @@ import html
 import os
 import random
 import re
+import shutil
 import string
 import time
 from datetime import date, datetime
+from urllib.parse import quote
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
@@ -142,6 +144,7 @@ router = Router()
 
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
+BROADCAST_DRAFT: dict[str, int] = {}
 MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
 
 
@@ -208,8 +211,15 @@ def get_product_price(product: dict, discount_active: bool) -> int:
     return base
 
 
-# ================= БАЗА ДАННЫХ =================
+# ================= БАЗА ДАННЫХ (С АВТОБЭКАПОМ ПЕРЕД СТАРТОМ) =================
 async def init_db():
+    # Делаем резервную копию существующей базы перед любыми операциями
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        try:
+            shutil.copy2(DB_PATH, f"{DB_PATH}.bak")
+        except Exception:
+            pass
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -251,7 +261,6 @@ async def init_db():
             except Exception:
                 pass
 
-        # Заполняем first_seen_at для старых пользователей без этого поля
         await db.execute(
             "UPDATE users SET first_seen_at = COALESCE(NULLIF(joined_at, 0), ?) WHERE first_seen_at = 0 OR first_seen_at IS NULL",
             (time.time(),),
@@ -500,10 +509,6 @@ async def reward_referrer_if_needed(user_id: int, bot: Bot):
 
 # ================= ФОНОВЫЙ ПЛАНИРОВЩИК: СКИДКА 50% НА 36 ЧАСОВ ЧЕРЕЗ 2 ЧАСА =================
 async def delayed_discount_watcher(bot: Bot):
-    """
-    Через 2 часа после первого сообщения боту автоматически активирует пользователю
-    скидку 50% на 36 часов, применяет её к ценам и отправляет уведомление.
-    """
     while True:
         try:
             now = time.time()
@@ -796,6 +801,7 @@ async def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
+            [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
             [InlineKeyboardButton(text=f"⚙️ Общий движок (для юзеров): {engine}", callback_data="adm_set_engine")],
@@ -810,6 +816,60 @@ async def admin_kb() -> InlineKeyboardMarkup:
 def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
+    )
+
+
+# ================= АДМИН: РАССЫЛКА ПО БАЗЕ =================
+@router.callback_query(F.data == "adm_broadcast")
+async def cb_adm_broadcast(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE[ADMIN_ID] = "adm_broadcast_msg"
+    await call.message.edit_text(
+        "📢 <b>Рассылка всем пользователям</b>\n\n"
+        "Отправь сообщение для рассылки (можно обычный текст с эмодзи или фото с подписью):",
+        reply_markup=admin_cancel_kb("admin_panel"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_broadcast_confirm")
+async def cb_adm_broadcast_confirm(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    src_chat = BROADCAST_DRAFT.get("chat_id")
+    src_msg = BROADCAST_DRAFT.get("message_id")
+    if not src_chat or not src_msg:
+        await call.answer("⚠️ Сообщение для рассылки не найдено.", show_alert=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            rows = await cur.fetchall()
+
+    user_ids = [r[0] for r in rows]
+    total = len(user_ids)
+    await call.message.edit_text(f"⏳ <b>Запускаю рассылку на {total} пользователей...</b>", parse_mode=ParseMode.HTML)
+    await call.answer()
+
+    sent_ok = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=src_chat, message_id=src_msg)
+            sent_ok += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    BROADCAST_DRAFT.clear()
+    await call.message.answer(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📨 Доставлено: <b>{sent_ok}</b>\n"
+        f"🚫 Не доставлено (заблокировали бота): <b>{failed}</b>",
+        reply_markup=await admin_kb(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1912,8 +1972,9 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     me = await bot.get_me()
-    ref_link = "https://" + f"t.me/{me.username}?start={call.from_user.id}"
-    share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){ref_link}&text=Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!"
+    ref_link = f"[https://t.me/](https://t.me/){me.username}?start={call.from_user.id}"
+    share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
+    share_url = f"[https://t.me/share/url?url=](https://t.me/share/url?url=){quote(ref_link)}&text={share_text}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
@@ -2168,6 +2229,24 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
 
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
+    # Если админ отправил фото в режиме рассылки
+    if message.from_user.id == ADMIN_ID and USER_INPUT_STATE.get(ADMIN_ID) == "adm_broadcast_msg":
+        USER_INPUT_STATE.pop(ADMIN_ID, None)
+        BROADCAST_DRAFT["chat_id"] = message.chat.id
+        BROADCAST_DRAFT["message_id"] = message.message_id
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Отправить всем пользователям", callback_data="adm_broadcast_confirm")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+            ]
+        )
+        await message.answer(
+            "👆 <b>Предпросмотр рассылки готов!</b>\nПодтвердить отправку этого поста всем пользователям бота?",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     mg_id = message.media_group_id
     if mg_id:
         is_first = mg_id not in MEDIA_GROUP_BUFFER
@@ -2199,7 +2278,23 @@ async def handle_prompt(message: Message, bot: Bot):
     if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
         action = USER_INPUT_STATE.pop(ADMIN_ID)
 
-        if action == "adm_u_search":
+        if action == "adm_broadcast_msg":
+            BROADCAST_DRAFT["chat_id"] = message.chat.id
+            BROADCAST_DRAFT["message_id"] = message.message_id
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Отправить всем пользователям", callback_data="adm_broadcast_confirm")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+                ]
+            )
+            await message.answer(
+                "👆 <b>Предпросмотр рассылки готов!</b>\nПодтвердить отправку этого сообщения всем пользователям бота?",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        elif action == "adm_u_search":
             q = text_in.lstrip("@").strip()
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
