@@ -46,7 +46,9 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
-IMAGE_GEN_COST = 2  # Сколько запросов списывать за 1 сгенерированную картинку
+PHOTO_COST = 3      # Сколько запросов списывать за 1 фото
+VIDEO_COST = 3      # Сколько запросов списывать за 1 видео
+IMAGE_GEN_COST = 3  # Сколько запросов списывать за 1 сгенерированную картинку
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 USERS_PER_PAGE = 8
@@ -75,6 +77,15 @@ FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "deepseek-v4-flash",
+    "claude-haiku-5-5",
+]
+
+VIDEO_FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.1-pro",
+    "gpt-5-mini",
     "claude-haiku-5-5",
 ]
 
@@ -148,14 +159,14 @@ PRODUCTS = {
 SYSTEM_PROMPT = (
     "Отвечай четко, по делу и на языке пользователя. "
     "Никогда не используй Markdown-разметку со звездочками (** или *) и решетками (###). Пиши обычным чистым текстом без выделения звездочками. "
-    "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
+    "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[, \\], $$, \\sqrt и обратные слэши \\). "
     "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2)."
 )
 
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
-    timeout=60.0,
+    timeout=90.0,
     max_retries=0,
 )
 router = Router()
@@ -177,7 +188,7 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
 def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = raw_text.replace("\r\n", "\n")
 
-    text = re.sub(r"\\\[\vert{}\\\]|\\\(\vert{}\\\)", "", text)
+    text = re.sub(r"\\\[|\\\]|\\\(|\\\)", "", text)
     text = text.replace("$$", "")
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
     text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
@@ -795,9 +806,6 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
             InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
         ],
-        [
-            InlineKeyboardButton(text="🧹 Сброс чата", callback_data="clear_chat"),
-        ],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
@@ -868,6 +876,7 @@ def profile_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎟 Активировать промокод", callback_data="promo_enter")],
             [InlineKeyboardButton(text="⭐ Купить подписку или пакет", callback_data="shop")],
             [InlineKeyboardButton(text="🏆 Лидерборд недели", callback_data="leaderboard")],
+            [InlineKeyboardButton(text="🧹 Сброс чата", callback_data="clear_chat")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")],
         ]
     )
@@ -925,7 +934,7 @@ async def cmd_img(message: Message, bot: Bot):
     if len(parts) < 2 or not parts[1].strip():
         USER_INPUT_STATE[message.from_user.id] = "await_image_prompt"
         await message.answer(
-            "🎨 Отправь описание картинки одним сообщением (стоимость: <b>2 запроса</b>):",
+            f"🎨 Отправь описание картинки одним сообщением (стоимость: <b>{IMAGE_GEN_COST} запроса</b>):",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
             ),
@@ -966,7 +975,7 @@ async def generate_image_bytes(prompt: str) -> bytes:
 async def run_image_generation(message: Message, prompt: str):
     user_id = message.from_user.id
     user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+    pro_active = is_pro(user)
 
     quota_receipt = await try_consume_quota(user_id, pro_active, count=IMAGE_GEN_COST)
     if not quota_receipt:
@@ -979,7 +988,7 @@ async def run_image_generation(message: Message, prompt: str):
         )
         return
 
-    wait_msg = await message.answer("🎨 <i>Рисую изображение, подожди 10–20 секунд...</i>", parse_mode=ParseMode.HTML)
+    wait_msg = await message.answer("🎨 <i>Генерирую изображение...</i>", parse_mode=ParseMode.HTML)
     try:
         img_bytes = await generate_image_bytes(prompt)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1000,6 +1009,115 @@ async def run_image_generation(message: Message, prompt: str):
         await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
             f"⚠️ <b>Не удалось сгенерировать картинку:</b>\n<code>{str(e)[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ================= ВИДЕО (АНАЛИЗ В GEMINI / CLAUDE / GPT) =================
+async def generate_video_response(
+    user_id: int, selected_model: str, caption: str, b64_video: str, mime_type: str
+) -> str:
+    if user_id == ADMIN_ID and selected_model:
+        candidates = [selected_model] + [m for m in VIDEO_FALLBACK_MODELS if m != selected_model]
+    else:
+        engine = await get_engine_model()
+        candidates = [engine] + [m for m in VIDEO_FALLBACK_MODELS if m != engine]
+
+    user_content = [
+        {"type": "text", "text": caption},
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_video}"}},
+    ]
+    messages_payload = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    last_error = None
+    for candidate_id in candidates:
+        try:
+            response = await ai_client.chat.completions.create(
+                model=candidate_id,
+                messages=messages_payload,
+                max_tokens=2000,
+            )
+            content = response.choices[0].message.content
+            if content:
+                return content
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise last_error or RuntimeError("Выбранная модель временно не смогла обработать видео")
+
+
+@router.message(F.video)
+async def handle_video(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    video = message.video
+    if video.file_size and video.file_size > 20 * 1024 * 1024:
+        await message.answer("⚠️ Видео слишком тяжёлое (лимит Telegram для ботов — до 20 МБ). Сожми видео или обрежь его.")
+        return
+
+    model_id = user["selected_model"]
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
+    if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
+        disc = has_active_discount(user)
+        await message.answer(
+            "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=VIDEO_COST)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            f"⏳ Для анализа видео нужно <b>{VIDEO_COST} запроса</b>, но твой баланс исчерпан.\n"
+            "Пригласи друга (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
+    wait_msg = await message.answer(f"🎬 <i>Анализирую видео ({shown_model})...</i>", parse_mode=ParseMode.HTML)
+
+    try:
+        file_info = await bot.get_file(video.file_id)
+        downloaded = await bot.download_file(file_info.file_path)
+        b64_video = base64.b64encode(downloaded.read()).decode("utf-8")
+        mime_type = video.mime_type or "video/mp4"
+        caption = (message.caption or "").strip() or "Подробно разбери, что происходит на этом видео, и ответь на задание или вопрос."
+
+        answer_text = await generate_video_response(
+            user_id=user_id,
+            selected_model=model_id,
+            caption=caption,
+            b64_video=b64_video,
+            mime_type=mime_type,
+        )
+
+        await add_history(user_id, "user", f"[Отправил видео с подписью: {caption}]")
+        await add_history(user_id, "assistant", answer_text)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
+                (VIDEO_COST, user_id),
+            )
+            await db.commit()
+
+        await wait_msg.delete()
+        await send_formatted_answer(message, answer_text)
+
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Не удалось обработать видео:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -2223,7 +2341,7 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Я понимаю <b>текст, фото (1 фото = 1 запрос), голосовые сообщения и текстовые файлы/код</b>, а также умею <b>рисовать картинки</b>!\n\n"
+        f"Я понимаю <b>текст, фото ({PHOTO_COST} запр.), видео ({VIDEO_COST} запр.), голосовые и файлы/код</b>, а также умею <b>рисовать картинки</b>!\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
         f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
@@ -2552,7 +2670,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 3 ЗАПРОСА) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2565,8 +2683,9 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         return
 
     count = len(messages)
+    total_cost = count * PHOTO_COST
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
-    quota_receipt = await try_consume_quota(user_id, pro_active, count=count)
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=total_cost)
     if not quota_receipt:
         disc = has_active_discount(user)
         total_limit = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
@@ -2574,9 +2693,9 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         extra_left = user.get("extra_requests") or 0
         avail = daily_left + extra_left
         await first_msg.answer(
-            f"⏳ <b>Недостаточно запросов для обработки {count} фото</b> (1 фото = 1 запрос).\n"
+            f"⏳ <b>Недостаточно запросов для обработки {count} фото</b> (1 фото = {PHOTO_COST} запр., нужно {total_cost}).\n"
             f"Сейчас доступно: <b>{avail} запр.</b>\n\n"
-            "Отправь меньше фотографий за раз, пригласи друга (/top) или оформи подписку / пакет:",
+            "Пригласи друга (/top) или оформи подписку / пакет:",
             reply_markup=shop_kb(disc),
             parse_mode=ParseMode.HTML,
         )
@@ -2584,9 +2703,9 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
 
     shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     status_label = (
-        f"📸 <i>Анализирую {count} фото (-{count} запр., {shown_model})...</i>"
+        f"📸 <i>Анализирую {count} фото (-{total_cost} запр., {shown_model})...</i>"
         if count > 1
-        else f"📸 <i>Анализирую изображение ({shown_model})...</i>"
+        else f"📸 <i>Анализирую изображение (-{total_cost} запр., {shown_model})...</i>"
     )
     wait_msg = await first_msg.answer(status_label, parse_mode=ParseMode.HTML)
 
@@ -2620,7 +2739,7 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
-                (count, user_id),
+                (total_cost, user_id),
             )
             await db.commit()
 
@@ -2676,243 +2795,3 @@ async def handle_prompt(message: Message, bot: Bot):
 
     if USER_INPUT_STATE.get(user_id) == "await_image_prompt":
         USER_INPUT_STATE.pop(user_id, None)
-        if not await ensure_subscribed(bot, user_id, message):
-            return
-        await run_image_generation(message, text_in)
-        return
-
-    if USER_INPUT_STATE.get(user_id) == "promo_activate":
-        USER_INPUT_STATE.pop(user_id, None)
-        if not await ensure_subscribed(bot, user_id, message):
-            return
-        ok, reply_text = await redeem_promocode(user_id, text_in)
-        await message.answer(reply_text, reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
-        return
-
-    if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
-        action = USER_INPUT_STATE.pop(ADMIN_ID)
-
-        if action == "adm_broadcast_msg":
-            BROADCAST_DRAFT["chat_id"] = message.chat.id
-            BROADCAST_DRAFT["message_id"] = message.message_id
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="✅ Отправить всем пользователям", callback_data="adm_broadcast_confirm")],
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
-                ]
-            )
-            await message.answer(
-                "👆 <b>Предпросмотр рассылки готов!</b>\nПодтвердить отправку этого сообщения всем пользователям бота?",
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        elif action == "adm_u_search":
-            q = text_in.lstrip("@").strip()
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                if q.isdigit():
-                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(q),)) as cur:
-                        row = await cur.fetchone()
-                else:
-                    async with db.execute(
-                        "SELECT user_id FROM users WHERE username LIKE ? OR full_name LIKE ? LIMIT 1",
-                        (f"%{q}%", f"%{q}%"),
-                    ) as cur:
-                        row = await cur.fetchone()
-
-            if not row:
-                await message.answer(
-                    "❌ Пользователь не найден в базе.",
-                    reply_markup=admin_cancel_kb("adm_users:0"),
-                )
-                return
-            text, kb = await render_user_card(row["user_id"], 0)
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            return
-
-        elif action.startswith("adm_u_pro_cust:"):
-            _, uid_s, page_s = action.split(":")
-            if not text_in.isdigit() or int(text_in) <= 0:
-                USER_INPUT_STATE[ADMIN_ID] = action
-                await message.answer("⚠️ Введи положительное число дней:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
-                return
-            target_id, days, page = int(uid_s), int(text_in), int(page_s)
-            target = await get_user(target_id)
-            new_until = max(time.time(), target["pro_until"]) + days * 86400
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, target_id))
-                await db.commit()
-            try:
-                await bot.send_message(target_id, f"🎁 Администратор выдал тебе <b>подписку на {days} дн.!</b> Открой /menu.", parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-            text, kb = await render_user_card(target_id, page)
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            return
-
-        elif action.startswith("adm_u_req_cust:"):
-            _, uid_s, page_s = action.split(":")
-            if not text_in.isdigit() or int(text_in) <= 0:
-                USER_INPUT_STATE[ADMIN_ID] = action
-                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
-                return
-            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
-            await get_user(target_id)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (amount, target_id))
-                await db.commit()
-            try:
-                await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>пакет на +{amount} запросов!</b>", parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-            text, kb = await render_user_card(target_id, page)
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            return
-
-        elif action.startswith("adm_u_subreq_cust:"):
-            _, uid_s, page_s = action.split(":")
-            if not text_in.isdigit() or int(text_in) <= 0:
-                USER_INPUT_STATE[ADMIN_ID] = action
-                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
-                return
-            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
-            user_t = await get_user(target_id)
-            removed = min(user_t.get("extra_requests", 0), amount)
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET extra_requests = MAX(0, extra_requests - ?) WHERE user_id = ?", (amount, target_id))
-                await db.commit()
-            if removed > 0:
-                try:
-                    await bot.send_message(
-                        target_id,
-                        f"⚠️ Администратор забрал у тебя <b>{removed} запросов</b> из пакета.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
-            text, kb = await render_user_card(target_id, page)
-            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-            return
-
-        elif action == "promo_custom_val":
-            if not text_in.isdigit() or int(text_in) <= 0:
-                USER_INPUT_STATE[ADMIN_ID] = "promo_custom_val"
-                await message.answer("⚠️ Введи положительное целое число:", reply_markup=admin_cancel_kb())
-                return
-            PROMO_DRAFT["amount"] = int(text_in)
-            await show_promo_step3_uses(message, edit=False)
-            return
-
-        elif action == "promo_custom_uses":
-            if not text_in.isdigit() or int(text_in) <= 0:
-                USER_INPUT_STATE[ADMIN_ID] = "promo_custom_uses"
-                await message.answer("⚠️ Введи положительное целое число:", reply_markup=admin_cancel_kb())
-                return
-            PROMO_DRAFT["max_uses"] = int(text_in)
-            await show_promo_step4_code(message, edit=False)
-            return
-
-        elif action == "promo_code_name":
-            if " " in text_in or len(text_in) < 2:
-                USER_INPUT_STATE[ADMIN_ID] = "promo_code_name"
-                await message.answer("⚠️ Код должен быть одним словом без пробелов (минимум 2 символа):", reply_markup=admin_cancel_kb())
-                return
-            await save_promo_and_reply(text_in, message, edit=False)
-            return
-
-        elif action == "set_engine":
-            if not text_in or " " in text_in:
-                await message.answer("⚠️ Введи корректный ID модели без пробелов.", reply_markup=await admin_kb())
-                return
-            await set_engine_model(text_in)
-            await message.answer(
-                f"✅ Общий движок изменен на <code>{text_in}</code> (для обычных пользователей).",
-                reply_markup=await admin_kb(),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-
-    if not await ensure_subscribed(bot, user_id, message):
-        return
-
-    model_id = user["selected_model"]
-    pro_active = is_pro(user) or (user_id == ADMIN_ID)
-
-    if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
-        disc = has_active_discount(user)
-        await message.answer(
-            "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
-            reply_markup=shop_kb(disc),
-        )
-        return
-
-    quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
-    if not quota_receipt:
-        disc = has_active_discount(user)
-        await message.answer(
-            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
-        )
-        return
-
-    wait_msg = await message.answer("⏳ <i>Думаю...</i>", parse_mode=ParseMode.HTML)
-
-    try:
-        history = await get_history(user_id)
-        answer_text = await generate_text_response(
-            user_id=user_id,
-            selected_model=model_id,
-            history=history,
-            user_text=message.text,
-        )
-
-        await add_history(user_id, "user", message.text)
-        await add_history(user_id, "assistant", answer_text)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
-            await db.commit()
-
-        await wait_msg.delete()
-        await send_formatted_answer(message, answer_text)
-
-    except Exception as e:
-        await refund_quota(user_id, quota_receipt)
-        await wait_msg.edit_text(
-            f"⚠️ <b>Сервер нейросетей временно перегружен:</b>\n<code>{str(e)[:250]}</code>\n\nПопробуй повторить запрос через минуту.",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-async def setup_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Запустить бота / Главное меню"),
-        BotCommand(command="menu", description="Выбрать нейросеть"),
-        BotCommand(command="img", description="Сгенерировать картинку по описанию"),
-        BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
-        BotCommand(command="shop", description="Купить подписку или пакет запросов"),
-        BotCommand(command="top", description="Еженедельный лидерборд и призы"),
-        BotCommand(command="clear", description="Очистить память диалога"),
-    ]
-    await bot.set_my_commands(commands)
-
-
-async def main():
-    await init_db()
-    bot = Bot(token=BOT_TOKEN)
-    await setup_bot_commands(bot)
-    asyncio.create_task(weekly_leaderboard_watcher(bot))
-    asyncio.create_task(delayed_discount_watcher(bot))
-    dp = Dispatcher()
-    dp.include_router(router)
-    print("Бот запущен!")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
