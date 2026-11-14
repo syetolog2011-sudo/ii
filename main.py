@@ -147,14 +147,12 @@ router = Router()
 
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
-ACTIVE_GENERATIONS: set[int] = set()
 
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
 def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = raw_text.replace("\r\n", "\n")
 
-    # Убираем LaTeX-скобки и типичные команды
     text = re.sub(r"\\\[\vert{}\\\]|\\\(\vert{}\\\)", "", text)
     text = text.replace("$$", "")
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
@@ -171,12 +169,10 @@ def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = re.sub(r"\\[a-zA-Z]+", "", text)
     text = text.replace("\\", "")
 
-    # Заменяем заголовки ### и маркеры списков
     text = re.sub(r"^#{1,6}\s*(.+)$", r"\1", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*[\*\-]\s+", "• ", text, flags=re.MULTILINE)
 
-    # Полностью убираем все двойные звёздочки **
     text = text.replace("**", "")
 
     plain = text.replace("__", "").replace("```", "").replace("`", "")
@@ -419,6 +415,7 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
 
 
 async def try_consume_quota(user_id: int, pro_active: bool) -> str | None:
+    """Атомарно резервирует 1 запрос ДО начала генерации, чтобы параллельные сообщения не обходили лимит."""
     if pro_active:
         return "pro"
     async with aiosqlite.connect(DB_PATH) as db:
@@ -485,7 +482,7 @@ async def reward_referrer_if_needed(user_id: int, bot: Bot):
                 await bot.send_message(
                     ref_id,
                     "🎉 По твоей ссылке подписался на канал новый друг!\n"
-                    "• Начислено <b>+2 запроса в день</b> навсегда\n"
+                    "• Начислено <b>+2 запроса в день</b>\n"
                     "• Засчитан <b>+1 балл</b> в еженедельный лидерборд (/top)!",
                     parse_mode=ParseMode.HTML,
                 )
@@ -538,7 +535,7 @@ async def distribute_weekly_rewards(bot: Bot, week_to_close: str) -> str:
                 prize_text = "🥉 Подписка на 7 дней"
             else:
                 await db.execute("UPDATE users SET extra_requests = extra_requests + 20 WHERE user_id = ?", (uid,))
-                prize_text = "⚡ +20 запросов навсегда"
+                prize_text = "⚡ Пакет +20 запросов"
 
             report_lines.append(f"{idx}. <b>{name}</b> ({cnt} реф.) — {prize_text}")
 
@@ -597,7 +594,7 @@ async def check_and_send_discount_offer(user_id: int, message: Message):
             f"• Пробный 1 день: <s>59 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_trial'], True)} ⭐</b>\n"
             f"• Стандарт 7 дней: <s>149 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_standard'], True)} ⭐</b>\n"
             f"• Премиум 30 дней: <s>349 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_premium'], True)} ⭐</b>\n\n"
-            "⚡ <b>Пакеты запросов (не сгорают никогда):</b>\n"
+            "⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>\n"
             f"• +30 запросов: <s>79 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_30'], True)} ⭐</b>\n"
             f"• +100 запросов: <s>199 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_100'], True)} ⭐</b>\n"
             f"• +300 запросов: <s>449 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_300'], True)} ⭐</b>\n\n"
@@ -731,7 +728,7 @@ def render_shop_text(user: dict) -> str:
         else:
             lines.append(f"• {p['title']} — <b>{price} ⭐</b>")
 
-    lines.append("\n⚡ <b>Пакеты запросов навсегда (не сгорают):</b>")
+    lines.append("\n⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>")
     for key in ("pack_30", "pack_100", "pack_300"):
         p = PRODUCTS[key]
         price = get_product_price(p, disc)
@@ -758,10 +755,10 @@ async def admin_kb() -> InlineKeyboardMarkup:
     engine = await get_engine_model()
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача)", callback_data="adm_users:0")],
+            [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
-            [InlineKeyboardButton(text=f"⚙️ Движок API: {engine}", callback_data="adm_set_engine")],
+            [InlineKeyboardButton(text=f"⚙️ Общий движок (для юзеров): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🏆 Завершить неделю и выдать призы", callback_data="adm_finish_week")],
             [InlineKeyboardButton(text="👑 Выдать Премиум себе (30 дн.)", callback_data="adm_self_pro")],
             [InlineKeyboardButton(text="🔌 Проверить живые модели API", callback_data="adm_check_api")],
@@ -792,7 +789,7 @@ async def render_users_list_page(page: int = 0) -> tuple[str, InlineKeyboardMark
     total_pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
     lines = [
         f"👥 <b>База пользователей (стр. {page + 1}/{total_pages}, всего: {total})</b>\n",
-        "Нажми на пользователя, чтобы посмотреть его статистику, покупки или выдать подписку / запросы:\n",
+        "Нажми на пользователя, чтобы посмотреть статистику, покупки, выдать или забрать подписку / запросы:\n",
     ]
     buttons = []
     now = time.time()
@@ -888,7 +885,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"💎 Подписка: {sub_str}\n"
         f"🤖 Модель: <b>{cur_model}</b>\n"
         f"⚡ Запросы сегодня: <b>{user['used_today']}/{total_daily}</b> (осталось {left_today})\n"
-        f"📦 Вечные пакеты: <b>{user.get('extra_requests', 0)} шт.</b>\n"
+        f"📦 Запросы из пакета: <b>{user.get('extra_requests', 0)} шт.</b>\n"
         f"🎁 Бонус к дневному лимиту: <b>+{user['bonus_limit']} в день</b>\n"
         f"📊 Всего запросов за всё время: <b>{user.get('total_requests', 0)}</b>\n\n"
         f"💳 <b>История покупок (всего на {total_stars} ⭐):</b>\n"
@@ -909,7 +906,12 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
             [
                 InlineKeyboardButton(text="⚡ +10 запр.", callback_data=f"adm_u_req:{target_id}:10:{back_page}"),
                 InlineKeyboardButton(text="⚡ +50 запр.", callback_data=f"adm_u_req:{target_id}:50:{back_page}"),
-                InlineKeyboardButton(text="✏️ Свои запр.", callback_data=f"adm_u_req_cust:{target_id}:{back_page}"),
+                InlineKeyboardButton(text="✏️ Выдать запр.", callback_data=f"adm_u_req_cust:{target_id}:{back_page}"),
+            ],
+            [
+                InlineKeyboardButton(text="➖ -10 запр.", callback_data=f"adm_u_subreq:{target_id}:10:{back_page}"),
+                InlineKeyboardButton(text="➖ Снять запр.", callback_data=f"adm_u_subreq_cust:{target_id}:{back_page}"),
+                InlineKeyboardButton(text="🗑 Обнулить пакет", callback_data=f"adm_u_clearreq:{target_id}:{back_page}"),
             ],
             [
                 InlineKeyboardButton(text="❌ Снять PRO", callback_data=f"adm_u_delpro:{target_id}:{back_page}"),
@@ -1010,7 +1012,7 @@ async def cb_adm_u_req(call: CallbackQuery, bot: Bot):
         await db.commit()
     await call.answer(f"⚡ Начислено +{amount} запросов!")
     try:
-        await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>+{amount} запросов навсегда!</b>", parse_mode=ParseMode.HTML)
+        await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>пакет на +{amount} запросов!</b>", parse_mode=ParseMode.HTML)
     except Exception:
         pass
     text, kb = await render_user_card(target_id, page)
@@ -1024,15 +1026,80 @@ async def cb_adm_u_req_cust(call: CallbackQuery):
     _, uid_s, page_s = call.data.split(":")
     USER_INPUT_STATE[ADMIN_ID] = f"adm_u_req_cust:{uid_s}:{page_s}"
     await call.message.edit_text(
-        f"⚡ Введи количество вечных запросов числом для пользователя <code>{uid_s}</code>:",
+        f"⚡ Введи количество запросов для начисления пользователю <code>{uid_s}</code>:",
         reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"),
         parse_mode=ParseMode.HTML,
     )
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("adm_u_subreq:"))
+async def cb_adm_u_subreq(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, amount_s, page_s = call.data.split(":")
+    target_id, amount, page = int(uid_s), int(amount_s), int(page_s)
+    user = await get_user(target_id)
+    cur_extra = user.get("extra_requests", 0)
+    removed = min(cur_extra, amount)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET extra_requests = MAX(0, extra_requests - ?) WHERE user_id = ?", (amount, target_id))
+        await db.commit()
+    await call.answer(f"➖ Списано {removed} запросов из пакета")
+    if removed > 0:
+        try:
+            await bot.send_message(
+                target_id,
+                f"⚠️ Администратор забрал у тебя <b>{removed} запросов</b> из пакета.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_u_subreq_cust:"))
+async def cb_adm_u_subreq_cust(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    USER_INPUT_STATE[ADMIN_ID] = f"adm_u_subreq_cust:{uid_s}:{page_s}"
+    await call.message.edit_text(
+        f"➖ Введи количество запросов, которое нужно забрать у пользователя <code>{uid_s}</code>:",
+        reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_u_clearreq:"))
+async def cb_adm_u_clearreq(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    _, uid_s, page_s = call.data.split(":")
+    target_id, page = int(uid_s), int(page_s)
+    user = await get_user(target_id)
+    cur_extra = user.get("extra_requests", 0)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET extra_requests = 0 WHERE user_id = ?", (target_id,))
+        await db.commit()
+    await call.answer("🗑 Пакет запросов обнулён")
+    if cur_extra > 0:
+        try:
+            await bot.send_message(
+                target_id,
+                f"⚠️ Администратор забрал у тебя все запросы из пакета (<b>{cur_extra} шт.</b>).",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    text, kb = await render_user_card(target_id, page)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
 @router.callback_query(F.data.startswith("adm_u_delpro:"))
-async def cb_adm_u_delpro(call: CallbackQuery):
+async def cb_adm_u_delpro(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
         return
     _, uid_s, page_s = call.data.split(":")
@@ -1041,6 +1108,14 @@ async def cb_adm_u_delpro(call: CallbackQuery):
         await db.execute("UPDATE users SET pro_until = 0 WHERE user_id = ?", (target_id,))
         await db.commit()
     await call.answer("❌ Подписка снята")
+    try:
+        await bot.send_message(
+            target_id,
+            "⚠️ Администратор забрал твою <b>PRO-подписку</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
     text, kb = await render_user_card(target_id, page)
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -1091,7 +1166,7 @@ async def render_leaderboard_text(user_id: int) -> str:
         "🥇 1 место — <b>Подписка на 30 дней</b>",
         "🥈 2 место — <b>Подписка на 15 дней</b>",
         "🥉 3 место — <b>Подписка на 7 дней</b>",
-        "🎖 4–10 места — <b>+20 запросов навсегда</b>\n",
+        "🎖 4–10 места — <b>Пакет +20 запросов</b>\n",
         "📊 <b>Текущий ТОП-10:</b>",
     ]
 
@@ -1192,7 +1267,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         f"🆔 Твой ID: <code>{user_id}</code>\n"
         f"{sub_block}\n"
         f"{req_block}\n"
-        f"📦 Запросы из пакетов (навсегда): <b>{extra} шт.</b>\n"
+        f"📦 Запросы из пакета: <b>{extra} шт.</b>\n"
         f"🤖 Выбранная модель: <b>{cur_model_name}</b>"
         f"{disc_line}"
     )
@@ -1275,7 +1350,7 @@ async def redeem_promocode(user_id: int, raw_code: str) -> tuple[bool, str]:
             bonus = promo["amount"]
             await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (bonus, user_id))
             await db.commit()
-            return True, f"🎉 Промокод <code>{code}</code> активирован! Начислено <b>+{bonus} запросов навсегда</b>."
+            return True, f"🎉 Промокод <code>{code}</code> активирован! Начислен <b>пакет на +{bonus} запросов</b>."
 
 
 # ================= АДМИН-ПАНЕЛЬ И КОНСТРУКТОР ПРОМОКОДОВ =================
@@ -1296,9 +1371,10 @@ async def render_admin_text() -> str:
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
-        f"⚙️ Активный движок: <code>{engine}</code>\n"
+        f"⚙️ Общий движок (для юзеров): <code>{engine}</code>\n"
+        f"👑 Для админа: <b>работают выбранные в меню модели</b>\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
-        f"👑 Активных подписок: <b>{pro_users}</b>\n"
+        f"💎 Активных подписок: <b>{pro_users}</b>\n"
         f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
         f"🎟 Создано промокодов: <b>{promos_count}</b>\n"
         f"⚡ Запросов сегодня: <b>{today_reqs}</b>\n\n"
@@ -1351,7 +1427,7 @@ async def cb_adm_promo_create(call: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="👑 Подписка (PRO)", callback_data="promo_type:sub")],
-                [InlineKeyboardButton(text="⚡ Запросы навсегда (пакет)", callback_data="promo_type:req")],
+                [InlineKeyboardButton(text="⚡ Пакет запросов", callback_data="promo_type:req")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
             ]
         ),
@@ -1386,8 +1462,8 @@ async def cb_promo_type(call: CallbackQuery):
     else:
         USER_INPUT_STATE[ADMIN_ID] = "promo_custom_val"
         await call.message.edit_text(
-            "⚡ <b>Промокод на запросы — Шаг 2/4</b>\n\n"
-            "Введи числом, сколько <b>несгораемых запросов</b> добавит промокод (например: <code>20</code> или <code>50</code>):",
+            "⚡ <b>Промокод на пакет запросов — Шаг 2/4</b>\n\n"
+            "Введи числом, сколько <b>запросов в пакет</b> добавит промокод (например: <code>20</code> или <code>50</code>):",
             reply_markup=admin_cancel_kb(),
             parse_mode=ParseMode.HTML,
         )
@@ -1488,7 +1564,7 @@ async def save_promo_and_reply(code: str, target_msg: Message, edit: bool = Fals
     reward_desc = (
         ("Подписка НАВСЕГДА" if amount >= 3650 else f"Подписка на {amount} дн.")
         if rtype == "sub"
-        else f"+{amount} запросов навсегда"
+        else f"Пакет +{amount} запросов"
     )
     uses_desc = "Бесконечный" if max_uses == 0 else f"На {max_uses} чел."
 
@@ -1559,7 +1635,7 @@ async def cb_adm_set_engine(call: CallbackQuery):
     USER_INPUT_STATE[ADMIN_ID] = "set_engine"
     current = await get_engine_model()
     await call.message.edit_text(
-        "⚙️ <b>Смена рабочего движка API</b>\n\n"
+        "⚙️ <b>Смена общего движка API (для обычных пользователей)</b>\n\n"
         f"Сейчас стоит: <code>{current}</code>\n\n"
         "Отправь точный ID модели с <code>unlockapi.space</code>:",
         reply_markup=admin_cancel_kb(),
@@ -1620,7 +1696,7 @@ async def cmd_givepro(message: Message, bot: Bot):
 
 
 @router.message(Command("delpro"))
-async def cmd_delpro(message: Message):
+async def cmd_delpro(message: Message, bot: Bot):
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split()
@@ -1632,6 +1708,10 @@ async def cmd_delpro(message: Message):
         await db.execute("UPDATE users SET pro_until = 0 WHERE user_id = ?", (target_id,))
         await db.commit()
     await message.answer(f"❌ У пользователя <code>{target_id}</code> снята подписка.", parse_mode=ParseMode.HTML)
+    try:
+        await bot.send_message(target_id, "⚠️ Администратор забрал твою <b>PRO-подписку</b>.", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 # ================= ХЭНДЛЕРЫ НАВИГАЦИИ =================
@@ -1706,7 +1786,7 @@ async def cb_open_category(call: CallbackQuery, bot: Bot):
     cat_key = call.data.split(":", 1)[1]
     user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     cat = CATEGORIES[cat_key]
-    pro_active = is_pro(user)
+    pro_active = is_pro(user) or (call.from_user.id == ADMIN_ID)
 
     try:
         await call.message.edit_text(
@@ -1727,7 +1807,7 @@ async def cb_set_model(call: CallbackQuery, bot: Bot):
     _, cat_key, model_id = call.data.split(":", 2)
     user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     model_info = ALL_MODELS_MAP.get(model_id)
-    pro_active = is_pro(user)
+    pro_active = is_pro(user) or (call.from_user.id == ADMIN_ID)
 
     if model_info and model_info["pro"] and not pro_active:
         await call.answer("🔒 Эта модель доступна только по подписке! Нажми «Подписка» в меню.", show_alert=True)
@@ -1787,7 +1867,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
     await call.message.answer(
         f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
         f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
-        f"• Твой дневной лимит вырастет на <b>+2 запроса</b> навсегда\n"
+        f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
         f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
         f"🔗 Твоя ссылка:\n<code>{ref_link}</code>",
         parse_mode=ParseMode.HTML,
@@ -1825,7 +1905,7 @@ async def cb_buy(call: CallbackQuery):
     if product["type"] == "sub":
         desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
     else:
-        desc = f"Пакет на {product['value']} дополнительных запросов (не сгорают со временем)."
+        desc = f"Пакет на {product['value']} дополнительных запросов."
 
     await call.message.answer_invoice(
         title=product["title"] + (" (Скидка 50%)" if disc else ""),
@@ -1881,16 +1961,22 @@ async def successful_payment(message: Message):
 
             await message.answer(
                 f"🎉 <b>Оплата прошла успешно!</b>\n"
-                f"На твой баланс зачислено <b>+{packs} запросов навсегда</b>.\n"
+                f"На твой баланс зачислен <b>пакет на +{packs} запросов</b>.\n"
                 f"Проверить остаток можно в /profile.",
                 parse_mode=ParseMode.HTML,
             )
 
 
-# ================= ЕДИНАЯ ГЕНЕРАЦИЯ (ТЕКСТ И ФОТО ЧЕРЕЗ ENGINE_MODEL) =================
-async def generate_text_with_engine(history: list[dict], user_text: str) -> str:
+# ================= ГЕНЕРАЦИЯ (ДЛЯ АДМИНА — ВЫБРАННАЯ МОДЕЛЬ, ДЛЯ ЮЗЕРОВ — ENGINE_MODEL) =================
+async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
+    if user_id == ADMIN_ID and selected_model:
+        return [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
     engine = await get_engine_model()
-    candidates = [engine] + [m for m in FALLBACK_MODELS if m != engine]
+    return [engine] + [m for m in FALLBACK_MODELS if m != engine]
+
+
+async def generate_text_response(user_id: int, selected_model: str, history: list[dict], user_text: str) -> str:
+    candidates = await get_candidates_for_user(user_id, selected_model)
 
     messages_payload = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -1916,9 +2002,8 @@ async def generate_text_with_engine(history: list[dict], user_text: str) -> str:
     raise last_error or RuntimeError("Все модели временно недоступны")
 
 
-async def generate_photo_with_engine(caption: str, b64_img: str) -> str:
-    engine = await get_engine_model()
-    candidates = [engine] + [m for m in FALLBACK_MODELS if m != engine]
+async def generate_photo_response(user_id: int, selected_model: str, caption: str, b64_img: str) -> str:
+    candidates = await get_candidates_for_user(user_id, selected_model)
 
     messages_payload = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -1957,22 +2042,17 @@ async def handle_photo(message: Message, bot: Bot):
     if not await ensure_subscribed(bot, user_id, message):
         return
 
-    if user_id in ACTIVE_GENERATIONS:
-        await message.answer("⏳ Дождись ответа на предыдущий запрос перед отправкой нового.")
-        return
-
-    pro_active = is_pro(user)
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
     quota_source = await try_consume_quota(user_id, pro_active)
     if not quota_source:
         disc = has_active_discount(user)
         await message.answer(
-            "⏳ Бесплатный лимит на сегодня и пакетные запросы исчерпаны.\n"
-            "Оформи подписку или возьми пакет запросов навсегда:",
+            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
+            "Оформи подписку или возьми пакет запросов:",
             reply_markup=shop_kb(disc),
         )
         return
 
-    ACTIVE_GENERATIONS.add(user_id)
     shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     wait_msg = await message.answer(f"📸 <i>Анализирую изображение ({shown_model})...</i>", parse_mode=ParseMode.HTML)
 
@@ -1983,7 +2063,12 @@ async def handle_photo(message: Message, bot: Bot):
         b64_img = base64.b64encode(downloaded.read()).decode("utf-8")
 
         caption = message.caption or "Подробно разбери и реши то, что изображено на фото."
-        answer_text = await generate_photo_with_engine(caption=caption, b64_img=b64_img)
+        answer_text = await generate_photo_response(
+            user_id=user_id,
+            selected_model=user["selected_model"],
+            caption=caption,
+            b64_img=b64_img,
+        )
 
         await add_history(user_id, "user", f"[Отправил фото с подписью: {caption}]")
         await add_history(user_id, "assistant", answer_text)
@@ -2003,8 +2088,6 @@ async def handle_photo(message: Message, bot: Bot):
             f"⚠️ <b>Не удалось распознать фото:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
         )
-    finally:
-        ACTIVE_GENERATIONS.discard(user_id)
 
 
 # ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
@@ -2080,9 +2163,34 @@ async def handle_prompt(message: Message, bot: Bot):
                 await db.execute("UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?", (amount, target_id))
                 await db.commit()
             try:
-                await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>+{amount} запросов навсегда!</b>", parse_mode=ParseMode.HTML)
+                await bot.send_message(target_id, f"🎁 Администратор начислил тебе <b>пакет на +{amount} запросов!</b>", parse_mode=ParseMode.HTML)
             except Exception:
                 pass
+            text, kb = await render_user_card(target_id, page)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
+        elif action.startswith("adm_u_subreq_cust:"):
+            _, uid_s, page_s = action.split(":")
+            if not text_in.isdigit() or int(text_in) <= 0:
+                USER_INPUT_STATE[ADMIN_ID] = action
+                await message.answer("⚠️ Введи положительное число запросов:", reply_markup=admin_cancel_kb(f"adm_u_view:{uid_s}:{page_s}"))
+                return
+            target_id, amount, page = int(uid_s), int(text_in), int(page_s)
+            user_t = await get_user(target_id)
+            removed = min(user_t.get("extra_requests", 0), amount)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET extra_requests = MAX(0, extra_requests - ?) WHERE user_id = ?", (amount, target_id))
+                await db.commit()
+            if removed > 0:
+                try:
+                    await bot.send_message(
+                        target_id,
+                        f"⚠️ Администратор забрал у тебя <b>{removed} запросов</b> из пакета.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
             text, kb = await render_user_card(target_id, page)
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
             return
@@ -2119,7 +2227,7 @@ async def handle_prompt(message: Message, bot: Bot):
                 return
             await set_engine_model(text_in)
             await message.answer(
-                f"✅ Рабочий движок изменен на <code>{text_in}</code> (для текста и фото).",
+                f"✅ Общий движок изменен на <code>{text_in}</code> (для обычных пользователей).",
                 reply_markup=await admin_kb(),
                 parse_mode=ParseMode.HTML,
             )
@@ -2130,12 +2238,8 @@ async def handle_prompt(message: Message, bot: Bot):
     if not await ensure_subscribed(bot, user_id, message):
         return
 
-    if user_id in ACTIVE_GENERATIONS:
-        await message.answer("⏳ Дождись ответа на предыдущий запрос перед отправкой нового.")
-        return
-
     model_id = user["selected_model"]
-    pro_active = is_pro(user)
+    pro_active = is_pro(user) or (user_id == ADMIN_ID)
 
     if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
         disc = has_active_discount(user)
@@ -2149,18 +2253,22 @@ async def handle_prompt(message: Message, bot: Bot):
     if not quota_source:
         disc = has_active_discount(user)
         await message.answer(
-            "⏳ Бесплатный лимит на сегодня и пакетные запросы исчерпаны.\n"
+            "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
             "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
             reply_markup=shop_kb(disc),
         )
         return
 
-    ACTIVE_GENERATIONS.add(user_id)
     wait_msg = await message.answer("⏳ <i>Думаю...</i>", parse_mode=ParseMode.HTML)
 
     try:
         history = await get_history(user_id)
-        answer_text = await generate_text_with_engine(history=history, user_text=message.text)
+        answer_text = await generate_text_response(
+            user_id=user_id,
+            selected_model=model_id,
+            history=history,
+            user_text=message.text,
+        )
 
         await add_history(user_id, "user", message.text)
         await add_history(user_id, "assistant", answer_text)
@@ -2180,8 +2288,6 @@ async def handle_prompt(message: Message, bot: Bot):
             f"⚠️ <b>Сервер нейросетей временно перегружен:</b>\n<code>{str(e)[:250]}</code>\n\nПопробуй повторить запрос через минуту.",
             parse_mode=ParseMode.HTML,
         )
-    finally:
-        ACTIVE_GENERATIONS.discard(user_id)
 
 
 async def setup_bot_commands(bot: Bot):
