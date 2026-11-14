@@ -12,6 +12,7 @@ import urllib.request
 from datetime import date, datetime
 from urllib.parse import quote
 import aiosqlite
+from PIL import Image
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -50,19 +51,15 @@ FREE_DAILY_LIMIT = 5
 PHOTO_COST = 5       # Сколько запросов списывать за 1 фото на разбор
 VIDEO_COST = 3       # Сколько запросов списывать за разбор входящего видео
 IMAGE_GEN_COST = 5   # Сколько запросов списывать за генерацию 1 картинки
-VIDEO_GEN_COST = 10  # Сколько запросов списывать за генерацию 1 видео
+MAX_ALBUM_PHOTOS = 4
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.5-flash-lite").strip()
 USERS_PER_PAGE = 8
 
 IMAGE_MODELS = [
     m.strip()
     for m in os.getenv("IMAGE_MODELS", "flux,gpt-image-1,dall-e-3").split(",")
-    if m.strip()
-]
-VIDEO_GEN_MODELS = [
-    m.strip()
-    for m in os.getenv("VIDEO_GEN_MODELS", "sora-2,veo-3,kling-v2,luma-ray-2").split(",")
     if m.strip()
 ]
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
@@ -84,6 +81,14 @@ FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "deepseek-v4-flash",
+    "claude-haiku-5-5",
+]
+
+VISION_FALLBACK_MODELS = [
+    VISION_MODEL,
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gpt-5-mini",
     "claude-haiku-5-5",
 ]
 
@@ -173,7 +178,7 @@ SYSTEM_PROMPT = (
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
-    timeout=120.0,
+    timeout=90.0,
     max_retries=0,
 )
 router = Router()
@@ -189,6 +194,33 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in USER_QUOTA_LOCKS:
         USER_QUOTA_LOCKS[user_id] = asyncio.Lock()
     return USER_QUOTA_LOCKS[user_id]
+
+
+# ================= СЖАТИЕ ФОТО ДЛЯ МИНИМАЛЬНОГО РАСХОДА ТОКЕНОВ =================
+def compress_image_bytes(raw_bytes: bytes, max_side: int = 1024, quality: int = 75) -> str:
+    img = Image.open(io.BytesIO(raw_bytes))
+    if img.mode in ("RGBA", "P", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        bg.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    w, h = img.size
+    if max(w, h) > max_side:
+        if w >= h:
+            new_w = max_side
+            new_h = max(1, int(h * (max_side / w)))
+        else:
+            new_h = max_side
+            new_w = max(1, int(w * (max_side / h)))
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(out.getvalue()).decode("utf-8")
 
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
@@ -806,14 +838,11 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎨 Генерация фото", callback_data="gen_image"),
         ],
         [
-            InlineKeyboardButton(text="🎬 Генерация видео", callback_data="gen_video"),
             InlineKeyboardButton(text="⭐ Подписка / Пакеты", callback_data="shop"),
-        ],
-        [
             InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-            InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
         ],
         [
+            InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
             InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
         ],
     ]
@@ -1022,151 +1051,6 @@ async def run_image_generation(message: Message, prompt: str):
         )
 
 
-# ================= ГЕНЕРАЦИЯ ВИДЕО =================
-@router.callback_query(F.data == "gen_video")
-async def cb_gen_video(call: CallbackQuery, bot: Bot):
-    if not await ensure_subscribed(bot, call.from_user.id, call.message):
-        await call.answer()
-        return
-    USER_INPUT_STATE[call.from_user.id] = "await_video_prompt"
-    await call.message.edit_text(
-        "🎬 <b>Генерация видео</b>\n\n"
-        "Опиши сценарий видеоролика (например: <i>«Дрон пролетает сквозь неоновый киберпанк-мегаполис в дождь, кинематографично»</i>).\n\n"
-        f"⚡ Стоимость: <b>{VIDEO_GEN_COST} запросов</b> (по подписке PRO — безлимит).",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-    await call.answer()
-
-
-@router.message(Command("vid"))
-async def cmd_vid(message: Message, bot: Bot):
-    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-    if not await ensure_subscribed(bot, message.from_user.id, message):
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        USER_INPUT_STATE[message.from_user.id] = "await_video_prompt"
-        await message.answer(
-            f"🎬 Отправь описание видеоролика одним сообщением (стоимость: <b>{VIDEO_GEN_COST} запросов</b>):",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-    await run_video_generation(message, parts[1].strip())
-
-
-async def generate_video_bytes(prompt: str) -> bytes:
-    last_error = None
-    loop = asyncio.get_running_loop()
-
-    for model_name in VIDEO_GEN_MODELS:
-        try:
-            # 1. Пробуем через эндпоинт /videos/generations (совместимый с OpenAI/Sora/UnlockAPI)
-            try:
-                resp = await ai_client.post(
-                    "/videos/generations",
-                    cast_to=dict,
-                    body={"model": model_name, "prompt": prompt},
-                )
-            except Exception:
-                # 2. Фолбэк через /images/generations, если провайдер отдаёт mp4-ссылку там
-                raw_resp = await ai_client.images.generate(
-                    model=model_name,
-                    prompt=prompt,
-                    n=1,
-                )
-                item = raw_resp.data[0]
-                resp = {
-                    "data": [
-                        {
-                            "url": getattr(item, "url", None),
-                            "b64_json": getattr(item, "b64_json", None),
-                        }
-                    ]
-                }
-
-            data_list = resp.get("data") or []
-            if data_list:
-                first = data_list[0]
-                if first.get("b64_json"):
-                    return base64.b64decode(first["b64_json"])
-                vid_url = first.get("url")
-                if vid_url:
-                    vid_bytes = await loop.run_in_executor(
-                        None, lambda u=vid_url: urllib.request.urlopen(u, timeout=60).read()
-                    )
-                    if vid_bytes:
-                        return vid_bytes
-
-            # 3. Если API вернул прямую ссылку в ответе чат-модели
-            chat_resp = await ai_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-            )
-            content = chat_resp.choices[0].message.content or ""
-            url_match = re.search(r"https?://[^\s\)\"']+\.mp4[^\s\)\"']*", content)
-            if url_match:
-                vid_url = url_match.group(0)
-                vid_bytes = await loop.run_in_executor(
-                    None, lambda u=vid_url: urllib.request.urlopen(u, timeout=60).read()
-                )
-                if vid_bytes:
-                    return vid_bytes
-
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise last_error or RuntimeError("Модели генерации видео временно недоступны на сервере API")
-
-
-async def run_video_generation(message: Message, prompt: str):
-    user_id = message.from_user.id
-    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-    pro_active = is_pro(user)
-
-    quota_receipt = await try_consume_quota(user_id, pro_active, count=VIDEO_GEN_COST)
-    if not quota_receipt:
-        disc = has_active_discount(user)
-        await message.answer(
-            f"⏳ Для генерации видео нужно <b>{VIDEO_GEN_COST} запросов</b>, но твой баланс исчерпан.\n"
-            "Пригласи друга (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    wait_msg = await message.answer("🎬 <i>Генерирую видеоролик...</i>", parse_mode=ParseMode.HTML)
-    try:
-        vid_bytes = await generate_video_bytes(prompt)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
-                (VIDEO_GEN_COST, user_id),
-            )
-            await db.commit()
-
-        await wait_msg.delete()
-        video_file = BufferedInputFile(vid_bytes, filename="generated.mp4")
-        await message.answer_video(
-            video=video_file,
-            caption=f"🎬 <b>Видео готово!</b>\n<i>Запрос: {html.escape(prompt[:200])}</i>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        await refund_quota(user_id, quota_receipt)
-        await wait_msg.edit_text(
-            f"⚠️ <b>Не удалось сгенерировать видео:</b>\n<code>{str(e)[:250]}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-
 # ================= ВИДЕО (АНАЛИЗ В GEMINI / CLAUDE / GPT) =================
 async def generate_video_response(
     user_id: int, selected_model: str, caption: str, b64_video: str, mime_type: str
@@ -1192,7 +1076,7 @@ async def generate_video_response(
             response = await ai_client.chat.completions.create(
                 model=candidate_id,
                 messages=messages_payload,
-                max_tokens=2000,
+                max_tokens=1500,
             )
             content = response.choices[0].message.content
             if content:
@@ -2133,8 +2017,8 @@ async def render_admin_text() -> str:
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
-        f"⚙️ Общий движок (для юзеров): <code>{engine}</code>\n"
-        f"👑 Для админа: <b>работают выбранные в меню модели</b>\n"
+        f"⚙️ Общий движок (текст): <code>{engine}</code>\n"
+        f"📸 Движок для фото: <code>{VISION_MODEL}</code> (сжатие 1024px)\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
         f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
@@ -2495,10 +2379,13 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Я понимаю <b>текст, фото ({PHOTO_COST} запр.), видео ({VIDEO_COST} запр.), голосовые и файлы/код</b>, а также умею <b>рисовать картинки ({IMAGE_GEN_COST} запр.) и создавать видео ({VIDEO_GEN_COST} запр.)</b>!\n\n"
+        f"Я — твой универсальный ИИ-помощник. Вот что я умею:\n"
+        f"💬 Отвечать на любые вопросы и писать код\n"
+        f"📸 Решать задачи и разбирать конспекты по фото\n"
+        f"🎨 Генерировать картинки по твоему описанию\n"
+        f"🎬 Разбирать видео, голосовые и текстовые файлы\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
-        f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
-        f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
+        f"🤖 Активная модель: <b>{cur_model_name}</b>"
     )
     await message.answer(text, reply_markup=categories_kb(message.from_user.id), parse_mode=ParseMode.HTML)
 
@@ -2757,7 +2644,7 @@ async def successful_payment(message: Message):
             )
 
 
-# ================= ГЕНЕРАЦИЯ (ТЕКСТ И ПАКЕТ ФОТОГРАФИЙ) =================
+# ================= ГЕНЕРАЦИЯ (ТЕКСТ И ЭКОНОМНЫЙ РАЗБОР ФОТО) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
     if user_id == ADMIN_ID and selected_model:
         return [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
@@ -2792,13 +2679,25 @@ async def generate_text_response(user_id: int, selected_model: str, history: lis
     raise last_error or RuntimeError("Все модели временно недоступны")
 
 
-async def generate_photos_response(user_id: int, selected_model: str, caption: str, b64_images: list[str]) -> str:
-    candidates = await get_candidates_for_user(user_id, selected_model)
+async def generate_photos_response(caption: str, b64_images: list[str]) -> str:
+    # Используем лёгкую vision-модель, чтобы расход токенов на фото был минимальным
+    seen = set()
+    candidates = []
+    for m in VISION_FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m)
+            candidates.append(m)
 
     user_content: list[dict] = [{"type": "text", "text": caption}]
     for b64_img in b64_images:
         user_content.append(
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64_img}",
+                    "detail": "auto",
+                },
+            }
         )
 
     messages_payload = [
@@ -2812,7 +2711,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
             response = await ai_client.chat.completions.create(
                 model=candidate_id,
                 messages=messages_payload,
-                max_tokens=2000,
+                max_tokens=1200,
             )
             content = response.choices[0].message.content
             if content:
@@ -2824,7 +2723,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 5 ЗАПРОСОВ) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 5 ЗАПРОСОВ, СЖАТИЕ ДО 1024px) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2834,6 +2733,13 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         username=first_msg.from_user.username or "",
     )
     if not await ensure_subscribed(bot, user_id, first_msg):
+        return
+
+    if len(messages) > MAX_ALBUM_PHOTOS:
+        await first_msg.answer(
+            f"⚠️ За один раз можно отправить максимум <b>{MAX_ALBUM_PHOTOS} фото</b>. Раздели альбом на несколько частей.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     count = len(messages)
@@ -2855,24 +2761,27 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
         )
         return
 
-    shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     status_label = (
-        f"📸 <i>Анализирую {count} фото (-{total_cost} запр., {shown_model})...</i>"
+        f"📸 <i>Анализирую {count} фото (-{total_cost} запр.)...</i>"
         if count > 1
-        else f"📸 <i>Анализирую изображение (-{total_cost} запр., {shown_model})...</i>"
+        else f"📸 <i>Анализирую изображение (-{total_cost} запр.)...</i>"
     )
     wait_msg = await first_msg.answer(status_label, parse_mode=ParseMode.HTML)
 
     try:
+        loop = asyncio.get_running_loop()
         b64_list: list[str] = []
         caption = ""
         for msg in messages:
             if msg.caption and not caption:
                 caption = msg.caption
-            photo = msg.photo[-1]
+            # Берём среднее разрешение (обычно 800px) вместо максимального 2560px и дополнительно сжимаем до 1024px
+            photo = msg.photo[-2] if len(msg.photo) >= 2 and msg.photo[-2].width >= 750 else msg.photo[-1]
             file_info = await bot.get_file(photo.file_id)
             downloaded = await bot.download_file(file_info.file_path)
-            b64_list.append(base64.b64encode(downloaded.read()).decode("utf-8"))
+            raw_bytes = downloaded.read()
+            compressed_b64 = await loop.run_in_executor(None, compress_image_bytes, raw_bytes, 1024, 75)
+            b64_list.append(compressed_b64)
 
         if not caption:
             if count > 1:
@@ -2881,8 +2790,6 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
                 caption = "Подробно разбери и реши то, что изображено на фото."
 
         answer_text = await generate_photos_response(
-            user_id=user_id,
-            selected_model=user["selected_model"],
             caption=caption,
             b64_images=b64_list,
         )
@@ -2941,7 +2848,7 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, КАРТИНОК, ВИДЕО, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+# ================= ОБРАБОТКА ТЕКСТА, КАРТИНОК, ПРОМОКОДОВ И АДМИН-ВВОДА =================
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -2952,13 +2859,6 @@ async def handle_prompt(message: Message, bot: Bot):
         if not await ensure_subscribed(bot, user_id, message):
             return
         await run_image_generation(message, text_in)
-        return
-
-    if USER_INPUT_STATE.get(user_id) == "await_video_prompt":
-        USER_INPUT_STATE.pop(user_id, None)
-        if not await ensure_subscribed(bot, user_id, message):
-            return
-        await run_video_generation(message, text_in)
         return
 
     if USER_INPUT_STATE.get(user_id) == "promo_activate":
@@ -3174,7 +3074,6 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="start", description="Запустить бота / Главное меню"),
         BotCommand(command="menu", description="Выбрать нейросеть"),
         BotCommand(command="img", description="Сгенерировать картинку по описанию"),
-        BotCommand(command="vid", description="Сгенерировать видео по описанию"),
         BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
         BotCommand(command="shop", description="Купить подписку или пакет запросов"),
         BotCommand(command="top", description="Еженедельный лидерборд и призы"),
