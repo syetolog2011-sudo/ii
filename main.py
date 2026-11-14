@@ -8,6 +8,7 @@ import re
 import shutil
 import string
 import time
+import urllib.request
 from datetime import date, datetime
 from urllib.parse import quote
 import aiosqlite
@@ -46,9 +47,10 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
-PHOTO_COST = 3      # Сколько запросов списывать за 1 фото
-VIDEO_COST = 3      # Сколько запросов списывать за 1 видео
-IMAGE_GEN_COST = 3  # Сколько запросов списывать за 1 сгенерированную картинку
+PHOTO_COST = 5       # Сколько запросов списывать за 1 фото на разбор
+VIDEO_COST = 3       # Сколько запросов списывать за разбор входящего видео
+IMAGE_GEN_COST = 5   # Сколько запросов списывать за генерацию 1 картинки
+VIDEO_GEN_COST = 10  # Сколько запросов списывать за генерацию 1 видео
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 USERS_PER_PAGE = 8
@@ -56,6 +58,11 @@ USERS_PER_PAGE = 8
 IMAGE_MODELS = [
     m.strip()
     for m in os.getenv("IMAGE_MODELS", "flux,gpt-image-1,dall-e-3").split(",")
+    if m.strip()
+]
+VIDEO_GEN_MODELS = [
+    m.strip()
+    for m in os.getenv("VIDEO_GEN_MODELS", "sora-2,veo-3,kling-v2,luma-ray-2").split(",")
     if m.strip()
 ]
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
@@ -166,7 +173,7 @@ SYSTEM_PROMPT = (
 ai_client = AsyncOpenAI(
     api_key=UNLOCK_API_KEY,
     base_url=UNLOCK_BASE_URL,
-    timeout=90.0,
+    timeout=120.0,
     max_retries=0,
 )
 router = Router()
@@ -799,11 +806,14 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎨 Генерация фото", callback_data="gen_image"),
         ],
         [
+            InlineKeyboardButton(text="🎬 Генерация видео", callback_data="gen_video"),
             InlineKeyboardButton(text="⭐ Подписка / Пакеты", callback_data="shop"),
-            InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
         ],
         [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
             InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
+        ],
+        [
             InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
         ],
     ]
@@ -916,7 +926,7 @@ async def cb_gen_image(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(
         "🎨 <b>Генерация изображений</b>\n\n"
         "Опиши текстом, что нужно нарисовать (например: <i>«Киберпанк-город ночью под неоновым дождём, детализация 4k»</i>).\n\n"
-        f"⚡ Стоимость: <b>{IMAGE_GEN_COST} запроса</b> (по подписке PRO — безлимит).",
+        f"⚡ Стоимость: <b>{IMAGE_GEN_COST} запросов</b> (по подписке PRO — безлимит).",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
         ),
@@ -934,7 +944,7 @@ async def cmd_img(message: Message, bot: Bot):
     if len(parts) < 2 or not parts[1].strip():
         USER_INPUT_STATE[message.from_user.id] = "await_image_prompt"
         await message.answer(
-            f"🎨 Отправь описание картинки одним сообщением (стоимость: <b>{IMAGE_GEN_COST} запроса</b>):",
+            f"🎨 Отправь описание картинки одним сообщением (стоимость: <b>{IMAGE_GEN_COST} запросов</b>):",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
             ),
@@ -958,7 +968,6 @@ async def generate_image_bytes(prompt: str) -> bytes:
             if getattr(item, "b64_json", None):
                 return base64.b64decode(item.b64_json)
             if getattr(item, "url", None):
-                import urllib.request
                 loop = asyncio.get_running_loop()
                 data = await loop.run_in_executor(
                     None, lambda u=item.url: urllib.request.urlopen(u, timeout=30).read()
@@ -981,7 +990,7 @@ async def run_image_generation(message: Message, prompt: str):
     if not quota_receipt:
         disc = has_active_discount(user)
         await message.answer(
-            f"⏳ Для генерации картинки нужно <b>{IMAGE_GEN_COST} запроса</b>, но твой баланс исчерпан.\n"
+            f"⏳ Для генерации картинки нужно <b>{IMAGE_GEN_COST} запросов</b>, но твой баланс исчерпан.\n"
             "Пригласи друга (/top) или оформи подписку / пакет:",
             reply_markup=shop_kb(disc),
             parse_mode=ParseMode.HTML,
@@ -1009,6 +1018,151 @@ async def run_image_generation(message: Message, prompt: str):
         await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
             f"⚠️ <b>Не удалось сгенерировать картинку:</b>\n<code>{str(e)[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ================= ГЕНЕРАЦИЯ ВИДЕО =================
+@router.callback_query(F.data == "gen_video")
+async def cb_gen_video(call: CallbackQuery, bot: Bot):
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
+        return
+    USER_INPUT_STATE[call.from_user.id] = "await_video_prompt"
+    await call.message.edit_text(
+        "🎬 <b>Генерация видео</b>\n\n"
+        "Опиши сценарий видеоролика (например: <i>«Дрон пролетает сквозь неоновый киберпанк-мегаполис в дождь, кинематографично»</i>).\n\n"
+        f"⚡ Стоимость: <b>{VIDEO_GEN_COST} запросов</b> (по подписке PRO — безлимит).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.message(Command("vid"))
+async def cmd_vid(message: Message, bot: Bot):
+    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, message.from_user.id, message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        USER_INPUT_STATE[message.from_user.id] = "await_video_prompt"
+        await message.answer(
+            f"🎬 Отправь описание видеоролика одним сообщением (стоимость: <b>{VIDEO_GEN_COST} запросов</b>):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_cats")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await run_video_generation(message, parts[1].strip())
+
+
+async def generate_video_bytes(prompt: str) -> bytes:
+    last_error = None
+    loop = asyncio.get_running_loop()
+
+    for model_name in VIDEO_GEN_MODELS:
+        try:
+            # 1. Пробуем через эндпоинт /videos/generations (совместимый с OpenAI/Sora/UnlockAPI)
+            try:
+                resp = await ai_client.post(
+                    "/videos/generations",
+                    cast_to=dict,
+                    body={"model": model_name, "prompt": prompt},
+                )
+            except Exception:
+                # 2. Фолбэк через /images/generations, если провайдер отдаёт mp4-ссылку там
+                raw_resp = await ai_client.images.generate(
+                    model=model_name,
+                    prompt=prompt,
+                    n=1,
+                )
+                item = raw_resp.data[0]
+                resp = {
+                    "data": [
+                        {
+                            "url": getattr(item, "url", None),
+                            "b64_json": getattr(item, "b64_json", None),
+                        }
+                    ]
+                }
+
+            data_list = resp.get("data") or []
+            if data_list:
+                first = data_list[0]
+                if first.get("b64_json"):
+                    return base64.b64decode(first["b64_json"])
+                vid_url = first.get("url")
+                if vid_url:
+                    vid_bytes = await loop.run_in_executor(
+                        None, lambda u=vid_url: urllib.request.urlopen(u, timeout=60).read()
+                    )
+                    if vid_bytes:
+                        return vid_bytes
+
+            # 3. Если API вернул прямую ссылку в ответе чат-модели
+            chat_resp = await ai_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+            )
+            content = chat_resp.choices[0].message.content or ""
+            url_match = re.search(r"https?://[^\s\)\"']+\.mp4[^\s\)\"']*", content)
+            if url_match:
+                vid_url = url_match.group(0)
+                vid_bytes = await loop.run_in_executor(
+                    None, lambda u=vid_url: urllib.request.urlopen(u, timeout=60).read()
+                )
+                if vid_bytes:
+                    return vid_bytes
+
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise last_error or RuntimeError("Модели генерации видео временно недоступны на сервере API")
+
+
+async def run_video_generation(message: Message, prompt: str):
+    user_id = message.from_user.id
+    user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    pro_active = is_pro(user)
+
+    quota_receipt = await try_consume_quota(user_id, pro_active, count=VIDEO_GEN_COST)
+    if not quota_receipt:
+        disc = has_active_discount(user)
+        await message.answer(
+            f"⏳ Для генерации видео нужно <b>{VIDEO_GEN_COST} запросов</b>, но твой баланс исчерпан.\n"
+            "Пригласи друга (/top) или оформи подписку / пакет:",
+            reply_markup=shop_kb(disc),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    wait_msg = await message.answer("🎬 <i>Генерирую видеоролик...</i>", parse_mode=ParseMode.HTML)
+    try:
+        vid_bytes = await generate_video_bytes(prompt)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET total_requests = total_requests + ? WHERE user_id = ?",
+                (VIDEO_GEN_COST, user_id),
+            )
+            await db.commit()
+
+        await wait_msg.delete()
+        video_file = BufferedInputFile(vid_bytes, filename="generated.mp4")
+        await message.answer_video(
+            video=video_file,
+            caption=f"🎬 <b>Видео готово!</b>\n<i>Запрос: {html.escape(prompt[:200])}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        await refund_quota(user_id, quota_receipt)
+        await wait_msg.edit_text(
+            f"⚠️ <b>Не удалось сгенерировать видео:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -2341,7 +2495,7 @@ async def cmd_start(message: Message, bot: Bot):
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     text = (
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
-        f"Я понимаю <b>текст, фото ({PHOTO_COST} запр.), видео ({VIDEO_COST} запр.), голосовые и файлы/код</b>, а также умею <b>рисовать картинки</b>!\n\n"
+        f"Я понимаю <b>текст, фото ({PHOTO_COST} запр.), видео ({VIDEO_COST} запр.), голосовые и файлы/код</b>, а также умею <b>рисовать картинки ({IMAGE_GEN_COST} запр.) и создавать видео ({VIDEO_GEN_COST} запр.)</b>!\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>\n"
         f"🧠 Память диалога: <b>Включена (/clear — очистить)</b>"
@@ -2670,7 +2824,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 3 ЗАПРОСА) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 5 ЗАПРОСОВ) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2787,7 +2941,7 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, КАРТИНОК, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+# ================= ОБРАБОТКА ТЕКСТА, КАРТИНОК, ВИДЕО, ПРОМОКОДОВ И АДМИН-ВВОДА =================
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -2798,6 +2952,13 @@ async def handle_prompt(message: Message, bot: Bot):
         if not await ensure_subscribed(bot, user_id, message):
             return
         await run_image_generation(message, text_in)
+        return
+
+    if USER_INPUT_STATE.get(user_id) == "await_video_prompt":
+        USER_INPUT_STATE.pop(user_id, None)
+        if not await ensure_subscribed(bot, user_id, message):
+            return
+        await run_video_generation(message, text_in)
         return
 
     if USER_INPUT_STATE.get(user_id) == "promo_activate":
@@ -3013,6 +3174,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="start", description="Запустить бота / Главное меню"),
         BotCommand(command="menu", description="Выбрать нейросеть"),
         BotCommand(command="img", description="Сгенерировать картинку по описанию"),
+        BotCommand(command="vid", description="Сгенерировать видео по описанию"),
         BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
         BotCommand(command="shop", description="Купить подписку или пакет запросов"),
         BotCommand(command="top", description="Еженедельный лидерборд и призы"),
