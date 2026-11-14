@@ -139,7 +139,6 @@ router = Router()
 
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
-# Буфер для склейки альбомов (нескольких фото за раз)
 MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
 
 
@@ -409,7 +408,6 @@ async def get_user(user_id: int, ref_id: int = 0, full_name: str = "", username:
 
 
 async def try_consume_quota(user_id: int, pro_active: bool) -> str | None:
-    """Атомарно резервирует 1 запрос ДО начала генерации."""
     if pro_active:
         return "pro"
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1865,6 +1863,7 @@ async def cb_ref_info(call: CallbackQuery, bot: Bot):
         f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
         f"🔗 Твоя ссылка:\n<code>{ref_link}</code>",
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
     await call.answer()
 
@@ -2111,7 +2110,6 @@ async def handle_photo(message: Message, bot: Bot):
         is_first = mg_id not in MEDIA_GROUP_BUFFER
         MEDIA_GROUP_BUFFER.setdefault(mg_id, []).append(message)
         if is_first:
-            # Ждём 1.3 секунды, чтобы Telegram успел прислать все 2-10 фото из альбома
             await asyncio.sleep(1.3)
             batch = MEDIA_GROUP_BUFFER.pop(mg_id, [])
             if batch:
