@@ -293,7 +293,6 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT DEFAULT 'Пользователь',
                 username TEXT DEFAULT '',
-                email TEXT DEFAULT '',
                 selected_model TEXT DEFAULT 'gpt-6-luna',
                 used_today INTEGER DEFAULT 0,
                 last_reset TEXT,
@@ -314,7 +313,6 @@ async def init_db():
         new_cols = [
             ("full_name", "TEXT DEFAULT 'Пользователь'"),
             ("username", "TEXT DEFAULT ''"),
-            ("email", "TEXT DEFAULT ''"),
             ("extra_requests", "INTEGER DEFAULT 0"),
             ("ref_rewarded", "INTEGER DEFAULT 0"),
             ("total_requests", "INTEGER DEFAULT 0"),
@@ -911,7 +909,6 @@ def render_shop_text(user: dict) -> str:
         else:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
-    lines.append("\n<i>Выбери нужный тариф ниже, чтобы выбрать способ оплаты (СБП / Карта или Telegram Stars):</i>")
     return "\n".join(lines)
 
 
@@ -987,7 +984,47 @@ async def cb_docs(call: CallbackQuery):
     await call.answer()
 
 
-# ================= ВЫБОР СПОСОБА ОПЛАТЫ (СБП / КАРТА ИЛИ TELEGRAM STARS) =================
+# ================= ВЫБОР СПОСОБА ОПЛАТЫ (СБП ИЛИ TELEGRAM STARS) =================
+@router.callback_query(F.data.startswith("choose_pay:"))
+async def cb_choose_pay(call: CallbackQuery):
+    prod_key = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(prod_key)
+    if not product:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    stars_price = get_product_price(product, disc)
+    rub_price = get_product_rub_price(product, disc)
+
+    if product["type"] == "sub":
+        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
+    else:
+        desc = f"Пакет на {product['value']} дополнительных запросов."
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 СБП — {rub_price} ₽", callback_data=f"pay_sbp:{prod_key}")],
+            [InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars_price} ⭐", callback_data=f"pay_stars:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="shop")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(
+            f"🛒 <b>Оформление заказа</b>\n\n"
+            f"📦 Тариф: <b>{product['title']}</b>\n"
+            f"📝 Описание: {desc}\n\n"
+            f"Чем вы хотите оплатить?",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("pay_sbp:"))
 async def cb_pay_sbp(call: CallbackQuery):
     prod_key = call.data.split(":", 1)[1]
@@ -1023,81 +1060,6 @@ async def cb_pay_sbp(call: CallbackQuery):
         )
     except TelegramBadRequest:
         pass
-    await call.answer()
-
-async def send_sbp_payment_screen(target_msg: Message, user_id: int, prod_key: str, email: str):
-    product = PRODUCTS[prod_key]
-    user = await get_user(user_id)
-    disc = has_active_discount(user)
-    rub_price = get_product_rub_price(product, disc)
-
-    if rub_price > MAX_RUB_TRANSACTION:
-        await target_msg.answer(
-            f"⚠️ Сумма платежа не может превышать {MAX_RUB_TRANSACTION} ₽.",
-            reply_markup=shop_kb(disc),
-        )
-        return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Изменить Email", callback_data=f"change_email:{prod_key}")],
-            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{prod_key}")],
-            [InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop")],
-        ]
-    )
-
-    await target_msg.answer(
-        f"💳 <b>Оплата через СБП (Platega)</b>\n\n"
-        f"📦 Тариф: <b>{product['title']}</b>\n"
-        f"💰 К оплате: <b>{rub_price} ₽</b>\n"
-        f"📧 Email для чека: <code>{html.escape(email)}</code>\n\n"
-        f"<i>Платёжный шлюз СБП находится на финальной проверке банка. "
-        f"Пока шлюз подключается, ты можешь моментально оплатить тариф через Telegram Stars кнопкой ниже или написать в поддержку @{SUPPORT_USERNAME}.</i>",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.callback_query(F.data.startswith("pay_sbp:"))
-async def cb_pay_sbp(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    product = PRODUCTS.get(prod_key)
-    if not product:
-        await call.answer("Товар не найден", show_alert=True)
-        return
-
-    user = await get_user(call.from_user.id)
-    saved_email = (user.get("email") or "").strip()
-
-    if not saved_email:
-        USER_INPUT_STATE[call.from_user.id] = f"await_pay_email:{prod_key}"
-        await call.message.edit_text(
-            "📧 <b>Укажите Email для получения чека</b>\n\n"
-            "По требованиям платёжного провайдера для создания платежа через СБП необходимо указать адрес электронной почты.\n\n"
-            "Отправь свой <b>Email</b> одним сообщением (например: <code>name@mail.ru</code>):",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        await call.answer()
-        return
-
-    await call.answer()
-    await send_sbp_payment_screen(call.message, call.from_user.id, prod_key, saved_email)
-
-
-@router.callback_query(F.data.startswith("change_email:"))
-async def cb_change_email(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    USER_INPUT_STATE[call.from_user.id] = f"await_pay_email:{prod_key}"
-    await call.message.edit_text(
-        "📧 Отправь новый <b>Email</b> для отправки чеков (например: <code>name@mail.ru</code>):",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
-        ),
-        parse_mode=ParseMode.HTML,
-    )
     await call.answer()
 
 
@@ -1622,7 +1584,6 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
     total_daily = FREE_DAILY_LIMIT + user["bonus_limit"]
     left_today = max(0, total_daily - user["used_today"])
     uname_str = f" (@{user['username']})" if user.get("username") else ""
-    email_str = f"<code>{html.escape(user['email'])}</code>" if user.get("email") else "<i>не указан</i>"
     joined_str = (
         datetime.fromtimestamp(user["joined_at"]).strftime("%d.%m.%Y %H:%M")
         if user.get("joined_at")
@@ -1665,7 +1626,6 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"👤 <b>Карточка пользователя</b>\n\n"
         f"📛 Имя: <b>{html.escape(user.get('full_name') or 'Пользователь')}</b>{uname_str}\n"
         f"🆔 ID: <code>{target_id}</code>\n"
-        f"📧 Email: {email_str}\n"
         f"📅 В боте с: <b>{joined_str}</b>\n"
         f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n\n"
         f"💎 Подписка: {sub_str}\n"
@@ -2049,8 +2009,6 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
         disc_line = f"\n🔥 Персональная скидка 50%: <b>Активна до {d_exp}</b>"
 
-    email_line = f"\n📧 Email для чеков: <code>{html.escape(user['email'])}</code>" if user.get("email") else ""
-
     return (
         f"👤 <b>Профиль — {html.escape(first_name)}</b>\n\n"
         f"🆔 Твой ID: <code>{user_id}</code>\n"
@@ -2058,7 +2016,6 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         f"{req_block}\n"
         f"📦 Запросы из пакета: <b>{extra} шт.</b>\n"
         f"🤖 Выбранная модель: <b>{cur_model_name}</b>"
-        f"{email_line}"
         f"{disc_line}"
     )
 
@@ -2907,37 +2864,13 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, EMAIL ДЛЯ ОПЛАТЫ, ПРОМОКОДОВ И АДМИН-ВВОДА =================
-EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
-
-
+# ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
     text_in = message.text.strip()
 
-    state = USER_INPUT_STATE.get(user_id, "")
-    if state.startswith("await_pay_email:"):
-        prod_key = state.split(":", 1)[1]
-        if not EMAIL_REGEX.match(text_in):
-            await message.answer(
-                "⚠️ Некорректный адрес электронной почты. Введи правильный Email (например: <code>user@mail.ru</code>):",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        USER_INPUT_STATE.pop(user_id, None)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET email = ? WHERE user_id = ?", (text_in.lower(), user_id))
-            await db.commit()
-
-        await send_sbp_payment_screen(message, user_id, prod_key, text_in.lower())
-        return
-
-    if state == "promo_activate":
+    if USER_INPUT_STATE.get(user_id) == "promo_activate":
         USER_INPUT_STATE.pop(user_id, None)
         if not await ensure_subscribed(bot, user_id, message):
             return
