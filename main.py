@@ -42,6 +42,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1991878700"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AetherNeural")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 
+# Документы и поддержка для модерации Platega / банка
+TERMS_URL = os.getenv("TERMS_URL", "https://telegra.ph/Polzovatelskoe-soglashenie-Oferta-11-15").strip()
+PRIVACY_URL = os.getenv("PRIVACY_URL", "https://telegra.ph/Politika-konfidencialnosti-11-15-68").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "AetherNeuralhelp").lstrip("@").strip()
+SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME}"
+MAX_RUB_TRANSACTION = 10000
+
 DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
@@ -55,6 +62,25 @@ USERS_PER_PAGE = 8
 
 DISCOUNT_DELAY_SECONDS = 2 * 3600      # Через 2 часа после первого сообщения
 DISCOUNT_DURATION_SECONDS = 36 * 3600  # Скидка действует 36 часов
+
+# Фильтр запрещённого контента (требование банка при согласовании ИИ-проектов)
+FORBIDDEN_PATTERNS = [
+    r"(?:детск\w*|несовершеннолетн\w*|малолетн\w*|лоли|школот\w*|ребен\w*|девочк\w*|мальчик\w*)\s*(?:порн\w*|секс\w*|интим\w*|голы\w*|обнажен\w*|эротик\w*)",
+    r"(?:порн\w*|секс\w*|интим\w*|голы\w*|обнажен\w*)\s*(?:с\s+)?(?:дет\w*|несовершеннолетн\w*|малолетн\w*|подростк\w*)",
+    r"(?:cp|csam|child\s*porn|underage\s*sex|loli\s*porn)",
+    r"(?:как\s+(?:сделать|собрать|изготовить|сварить)|инструкци\w*\s+по\s+изготовлени\w*|рецепт\s+изготовлени\w*)\s*(?:бомб\w*|взрывчат\w*|оружи\w*|огнестрел\w*|пистолет\w*|автомат\w*|гранат\w*|коктейл\w*\s+молотов\w*|тротил\w*|гексоген\w*|порох\w*)",
+    r"(?:how\s+to\s+(?:make|build|manufacture))\s+(?:a\s+)?(?:bomb|explosive|gun|firearm|weapon|ricin|meth)",
+    r"(?:как\s+(?:сварить|изготовить|синтезировать)|рецепт)\s*(?:мефедрон\w*|амфетамин\w*|героин\w*|наркотик\w*|соль\s+для\s+курени\w*)",
+    r"(?:способы\s+(?:суицида|самоубийства)|как\s+покончить\s+с\s+собой)",
+]
+FORBIDDEN_REGEX = re.compile("|".join(FORBIDDEN_PATTERNS), flags=re.IGNORECASE)
+
+
+def is_content_forbidden(text: str) -> bool:
+    if not text:
+        return False
+    return bool(FORBIDDEN_REGEX.search(text))
+
 
 TEXT_FILE_EXTS = {
     ".txt", ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".htm", ".css",
@@ -140,20 +166,22 @@ for cat_data in CATEGORIES.values():
         if m["id"] not in ALL_MODELS_MAP:
             ALL_MODELS_MAP[m["id"]] = m
 
+# Цены в рублях рассчитаны по курсу 1 ⭐ ≈ 1.3 ₽ с округлением (все строго до 10 000 ₽)
 PRODUCTS = {
-    "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 59, "value": 1},
-    "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 149, "value": 7},
-    "sub_premium": {"type": "sub", "title": "Премиум 30 дней", "stars": 349, "value": 30},
-    "pack_30": {"type": "pack", "title": "Пакет +30 запросов", "stars": 79, "value": 30},
-    "pack_100": {"type": "pack", "title": "Пакет +100 запросов", "stars": 199, "value": 100},
-    "pack_300": {"type": "pack", "title": "Пакет +300 запросов", "stars": 449, "value": 300},
+    "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 59, "rub": 79, "value": 1},
+    "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 149, "rub": 199, "value": 7},
+    "sub_premium": {"type": "sub", "title": "Премиум 30 дней", "stars": 349, "rub": 449, "value": 30},
+    "pack_30": {"type": "pack", "title": "Пакет +30 запросов", "stars": 79, "rub": 99, "value": 30},
+    "pack_100": {"type": "pack", "title": "Пакет +100 запросов", "stars": 199, "rub": 259, "value": 100},
+    "pack_300": {"type": "pack", "title": "Пакет +300 запросов", "stars": 449, "rub": 589, "value": 300},
 }
 
 SYSTEM_PROMPT = (
     "Отвечай четко, по делу и на языке пользователя. "
     "Никогда не используй Markdown-разметку со звездочками (** или *) и решетками (###). Пиши обычным чистым текстом без выделения звездочками. "
     "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
-    "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2)."
+    "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2). "
+    "Строго отказывайся выполнять запросы, связанные с сексуальным контентом с участием несовершеннолетних, изготовлением оружия, взрывчатки, наркотиков или причинением вреда."
 )
 
 ai_client = AsyncOpenAI(
@@ -240,6 +268,13 @@ def get_product_price(product: dict, discount_active: bool) -> int:
     return base
 
 
+def get_product_rub_price(product: dict, discount_active: bool) -> int:
+    base = product["rub"]
+    if discount_active:
+        return max(10, round(base * 0.5))
+    return base
+
+
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
     db_dir = os.path.dirname(os.path.abspath(DB_PATH))
@@ -258,6 +293,7 @@ async def init_db():
                 user_id INTEGER PRIMARY KEY,
                 full_name TEXT DEFAULT 'Пользователь',
                 username TEXT DEFAULT '',
+                email TEXT DEFAULT '',
                 selected_model TEXT DEFAULT 'gpt-6-luna',
                 used_today INTEGER DEFAULT 0,
                 last_reset TEXT,
@@ -278,6 +314,7 @@ async def init_db():
         new_cols = [
             ("full_name", "TEXT DEFAULT 'Пользователь'"),
             ("username", "TEXT DEFAULT ''"),
+            ("email", "TEXT DEFAULT ''"),
             ("extra_requests", "INTEGER DEFAULT 0"),
             ("ref_rewarded", "INTEGER DEFAULT 0"),
             ("total_requests", "INTEGER DEFAULT 0"),
@@ -618,15 +655,15 @@ async def delayed_discount_watcher(bot: Bot):
 
                     offer_text = (
                         "🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА 50% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
-                        "Мы снизили цены вдвое на все тарифы и пакеты запросов специально для тебя на ближайшие <b>36 часов</b> (скидка уже применена ко всем ценам ниже):\n\n"
+                        "Мы снизили цены вдвое на все тарифы и пакеты запросов специально для тебя на ближайшие <b>36 часов</b>:\n\n"
                         "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
-                        f"• Пробный 1 день: <s>59 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_trial'], True)} ⭐</b>\n"
-                        f"• Стандарт 7 дней: <s>149 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_standard'], True)} ⭐</b>\n"
-                        f"• Премиум 30 дней: <s>349 ⭐</s> → <b>{get_product_price(PRODUCTS['sub_premium'], True)} ⭐</b>\n\n"
+                        f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], True)} ⭐)\n"
+                        f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], True)} ⭐)\n"
+                        f"• Премиум 30 дней: <s>449 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], True)} ⭐)\n\n"
                         "⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>\n"
-                        f"• +30 запросов: <s>79 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_30'], True)} ⭐</b>\n"
-                        f"• +100 запросов: <s>199 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_100'], True)} ⭐</b>\n"
-                        f"• +300 запросов: <s>449 ⭐</s> → <b>{get_product_price(PRODUCTS['pack_300'], True)} ⭐</b>\n\n"
+                        f"• +30 запросов: <s>99 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_30'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_30'], True)} ⭐)\n"
+                        f"• +100 запросов: <s>259 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_100'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_100'], True)} ⭐)\n"
+                        f"• +300 запросов: <s>589 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_300'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_300'], True)} ⭐)\n\n"
                         "👇 Жми на любой тариф прямо сейчас, пока действует акция:"
                     )
                     try:
@@ -797,12 +834,24 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
+            InlineKeyboardButton(text="📄 Документы", callback_data="docs"),
         ],
     ]
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def docs_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Пользовательское соглашение", url=TERMS_URL)],
+            [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=PRIVACY_URL)],
+            [InlineKeyboardButton(text="🆘 Написать в поддержку", url=SUPPORT_URL)],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")],
+        ]
+    )
 
 
 def models_in_category_kb(cat_key: str, current_model: str, pro_active: bool) -> InlineKeyboardMarkup:
@@ -821,13 +870,14 @@ def models_in_category_kb(cat_key: str, current_model: str, pro_active: bool) ->
 def shop_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for key, p in PRODUCTS.items():
-        price = get_product_price(p, discount_active)
+        stars_price = get_product_price(p, discount_active)
+        rub_price = get_product_rub_price(p, discount_active)
         if discount_active:
-            label = f"🔥 {p['title']} — {price} ⭐ (вместо {p['stars']})"
+            label = f"🔥 {p['title']} — {rub_price} ₽ / {stars_price} ⭐"
         else:
             icon = "👑" if p["type"] == "sub" else "⚡"
-            label = f"{icon} {p['title']} — {price} ⭐"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"buy:{key}")])
+            label = f"{icon} {p['title']} — {rub_price} ₽ / {stars_price} ⭐"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"choose_pay:{key}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -844,21 +894,24 @@ def render_shop_text(user: dict) -> str:
     lines = [header, "👑 <b>Безлимитные подписки (все PRO-модели):</b>"]
     for key in ("sub_trial", "sub_standard", "sub_premium"):
         p = PRODUCTS[key]
-        price = get_product_price(p, disc)
+        sp = get_product_price(p, disc)
+        rp = get_product_rub_price(p, disc)
         if disc:
-            lines.append(f"• {p['title']}: <s>{p['stars']} ⭐</s> → <b>{price} ⭐</b>")
+            lines.append(f"• {p['title']}: <s>{p['rub']} ₽</s> → <b>{rp} ₽</b> ({sp} ⭐)")
         else:
-            lines.append(f"• {p['title']} — <b>{price} ⭐</b>")
+            lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
     lines.append("\n⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>")
     for key in ("pack_30", "pack_100", "pack_300"):
         p = PRODUCTS[key]
-        price = get_product_price(p, disc)
+        sp = get_product_price(p, disc)
+        rp = get_product_rub_price(p, disc)
         if disc:
-            lines.append(f"• {p['title']}: <s>{p['stars']} ⭐</s> → <b>{price} ⭐</b>")
+            lines.append(f"• {p['title']}: <s>{p['rub']} ₽</s> → <b>{rp} ₽</b> ({sp} ⭐)")
         else:
-            lines.append(f"• {p['title']} — <b>{price} ⭐</b>")
+            lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
+    lines.append("\n<i>Выбери нужный тариф ниже, чтобы выбрать способ оплаты (СБП / Карта или Telegram Stars):</i>")
     return "\n".join(lines)
 
 
@@ -896,6 +949,236 @@ def admin_cancel_kb(back_cb: str = "admin_panel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
     )
+
+
+# ================= ДОКУМЕНТЫ И ПОДДЕРЖКА =================
+def render_docs_text() -> str:
+    return (
+        "📄 <b>Юридическая информация и поддержка</b>\n\n"
+        "Ознакомься с правилами использования сервиса и политикой обработки данных по ссылкам ниже:\n\n"
+        f"• Пользовательское соглашение: {TERMS_URL}\n"
+        f"• Политика конфиденциальности: {PRIVACY_URL}\n"
+        f"• Служба поддержки: @{SUPPORT_USERNAME}\n\n"
+        "<i>Максимальная сумма одной транзакции при оплате в рублях — 10 000 ₽.</i>"
+    )
+
+
+@router.message(Command("docs"))
+async def cmd_docs(message: Message):
+    await message.answer(
+        render_docs_text(),
+        reply_markup=docs_kb(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "docs")
+async def cb_docs(call: CallbackQuery):
+    try:
+        await call.message.edit_text(
+            render_docs_text(),
+            reply_markup=docs_kb(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+# ================= ВЫБОР СПОСОБА ОПЛАТЫ (СБП / КАРТА ИЛИ TELEGRAM STARS) =================
+@router.callback_query(F.data.startswith("choose_pay:"))
+async def cb_choose_pay(call: CallbackQuery):
+    prod_key = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(prod_key)
+    if not product:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    stars_price = get_product_price(product, disc)
+    rub_price = get_product_rub_price(product, disc)
+
+    if product["type"] == "sub":
+        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
+    else:
+        desc = f"Пакет на {product['value']} дополнительных запросов."
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 СБП / Банковская карта — {rub_price} ₽", callback_data=f"pay_sbp:{prod_key}")],
+            [InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars_price} ⭐", callback_data=f"pay_stars:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="shop")],
+        ]
+    )
+
+    try:
+        await call.message.edit_text(
+            f"🛒 <b>Оформление заказа</b>\n\n"
+            f"📦 Тариф: <b>{product['title']}</b>\n"
+            f"📝 Описание: {desc}\n\n"
+            f"Выбери удобный способ оплаты:",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+async def send_sbp_payment_screen(target_msg: Message, user_id: int, prod_key: str, email: str):
+    product = PRODUCTS[prod_key]
+    user = await get_user(user_id)
+    disc = has_active_discount(user)
+    rub_price = get_product_rub_price(product, disc)
+
+    if rub_price > MAX_RUB_TRANSACTION:
+        await target_msg.answer(
+            f"⚠️ Сумма платежа не может превышать {MAX_RUB_TRANSACTION} ₽.",
+            reply_markup=shop_kb(disc),
+        )
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить Email", callback_data=f"change_email:{prod_key}")],
+            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop")],
+        ]
+    )
+
+    await target_msg.answer(
+        f"💳 <b>Оплата через СБП (Platega)</b>\n\n"
+        f"📦 Тариф: <b>{product['title']}</b>\n"
+        f"💰 К оплате: <b>{rub_price} ₽</b>\n"
+        f"📧 Email для чека: <code>{html.escape(email)}</code>\n\n"
+        f"<i>Платёжный шлюз СБП находится на финальной проверке банка. "
+        f"Пока шлюз подключается, ты можешь моментально оплатить тариф через Telegram Stars кнопкой ниже или написать в поддержку @{SUPPORT_USERNAME}.</i>",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("pay_sbp:"))
+async def cb_pay_sbp(call: CallbackQuery):
+    prod_key = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(prod_key)
+    if not product:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    saved_email = (user.get("email") or "").strip()
+
+    if not saved_email:
+        USER_INPUT_STATE[call.from_user.id] = f"await_pay_email:{prod_key}"
+        await call.message.edit_text(
+            "📧 <b>Укажите Email для получения чека</b>\n\n"
+            "По требованиям платёжного провайдера для создания платежа через СБП необходимо указать адрес электронной почты.\n\n"
+            "Отправь свой <b>Email</b> одним сообщением (например: <code>name@mail.ru</code>):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        await call.answer()
+        return
+
+    await call.answer()
+    await send_sbp_payment_screen(call.message, call.from_user.id, prod_key, saved_email)
+
+
+@router.callback_query(F.data.startswith("change_email:"))
+async def cb_change_email(call: CallbackQuery):
+    prod_key = call.data.split(":", 1)[1]
+    USER_INPUT_STATE[call.from_user.id] = f"await_pay_email:{prod_key}"
+    await call.message.edit_text(
+        "📧 Отправь новый <b>Email</b> для отправки чеков (например: <code>name@mail.ru</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pay_stars:"))
+async def cb_pay_stars(call: CallbackQuery):
+    prod_key = call.data.split(":", 1)[1]
+    product = PRODUCTS.get(prod_key)
+    if not product:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    final_price = get_product_price(product, disc)
+
+    if product["type"] == "sub":
+        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
+    else:
+        desc = f"Пакет на {product['value']} дополнительных запросов."
+
+    await call.message.answer_invoice(
+        title=product["title"] + (" (Скидка 50%)" if disc else ""),
+        description=desc,
+        payload=f"prod:{prod_key}",
+        currency="XTR",
+        prices=[LabeledPrice(label=product["title"], amount=final_price)],
+    )
+    await call.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    prod_key = payload.split(":", 1)[1]
+    product = PRODUCTS[prod_key]
+    paid_stars = message.successful_payment.total_amount
+    user = await get_user(message.from_user.id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO payments (user_id, product_key, title, stars, paid_at) VALUES (?, ?, ?, ?, ?)",
+            (message.from_user.id, prod_key, product["title"], paid_stars, time.time()),
+        )
+
+        if product["type"] == "sub":
+            days = product["value"]
+            base_time = max(time.time(), user["pro_until"])
+            new_pro_until = base_time + days * 86400
+            exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
+
+            await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_pro_until, message.from_user.id))
+            await db.commit()
+
+            await message.answer(
+                f"🎉 <b>Оплата прошла успешно!</b>\n"
+                f"Тариф <b>«{product['title']}»</b> активен до <b>{exp_date}</b>.\n"
+                f"Все модели разблокированы в /menu.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            packs = product["value"]
+            await db.execute(
+                "UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?",
+                (packs, message.from_user.id),
+            )
+            await db.commit()
+
+            await message.answer(
+                f"🎉 <b>Оплата прошла успешно!</b>\n"
+                f"На твой баланс зачислен <b>пакет на +{packs} запросов</b>.\n"
+                f"Проверить остаток можно в /profile.",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 # ================= ВИДЕО (АНАЛИЗ В GEMINI / CLAUDE / GPT, 1 ВИДЕО = 1 ЗАПРОС) =================
@@ -940,6 +1223,10 @@ async def handle_video(message: Message, bot: Bot):
     user_id = message.from_user.id
     user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    if is_content_forbidden(message.caption or ""):
+        await message.answer("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
         return
 
     video = message.video
@@ -1050,6 +1337,11 @@ async def handle_voice(message: Message, bot: Bot):
         if not recognized_text:
             raise RuntimeError("Не удалось разобрать слова в голосовом сообщении")
 
+        if is_content_forbidden(recognized_text):
+            await refund_quota(user_id, quota_receipt)
+            await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+            return
+
         history = await get_history(user_id)
         answer_text = await generate_text_response(
             user_id=user_id,
@@ -1159,6 +1451,11 @@ async def handle_document(message: Message, bot: Bot):
 
         if not file_text:
             raise RuntimeError("Файл пустой")
+
+        if is_content_forbidden(file_text) or is_content_forbidden(message.caption or ""):
+            await refund_quota(user_id, quota_receipt)
+            await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+            return
 
         if len(file_text) > 18000:
             file_text = file_text[:18000] + "\n\n[...текст файла обрезан до 18 000 символов...]"
@@ -1328,6 +1625,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
     total_daily = FREE_DAILY_LIMIT + user["bonus_limit"]
     left_today = max(0, total_daily - user["used_today"])
     uname_str = f" (@{user['username']})" if user.get("username") else ""
+    email_str = f"<code>{html.escape(user['email'])}</code>" if user.get("email") else "<i>не указан</i>"
     joined_str = (
         datetime.fromtimestamp(user["joined_at"]).strftime("%d.%m.%Y %H:%M")
         if user.get("joined_at")
@@ -1370,6 +1668,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"👤 <b>Карточка пользователя</b>\n\n"
         f"📛 Имя: <b>{html.escape(user.get('full_name') or 'Пользователь')}</b>{uname_str}\n"
         f"🆔 ID: <code>{target_id}</code>\n"
+        f"📧 Email: {email_str}\n"
         f"📅 В боте с: <b>{joined_str}</b>\n"
         f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n\n"
         f"💎 Подписка: {sub_str}\n"
@@ -1753,6 +2052,8 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
         disc_line = f"\n🔥 Персональная скидка 50%: <b>Активна до {d_exp}</b>"
 
+    email_line = f"\n📧 Email для чеков: <code>{html.escape(user['email'])}</code>" if user.get("email") else ""
+
     return (
         f"👤 <b>Профиль — {html.escape(first_name)}</b>\n\n"
         f"🆔 Твой ID: <code>{user_id}</code>\n"
@@ -1760,6 +2061,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         f"{req_block}\n"
         f"📦 Запросы из пакета: <b>{extra} шт.</b>\n"
         f"🤖 Выбранная модель: <b>{cur_model_name}</b>"
+        f"{email_line}"
         f"{disc_line}"
     )
 
@@ -2410,84 +2712,6 @@ async def cb_shop(call: CallbackQuery, bot: Bot):
     await call.answer()
 
 
-# ================= ОПЛАТА TELEGRAM STARS (ПОДПИСКИ И ПАКЕТЫ) =================
-@router.callback_query(F.data.startswith("buy:"))
-async def cb_buy(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    product = PRODUCTS.get(prod_key)
-    if not product:
-        await call.answer("Товар не найден", show_alert=True)
-        return
-
-    user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    final_price = get_product_price(product, disc)
-
-    if product["type"] == "sub":
-        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
-    else:
-        desc = f"Пакет на {product['value']} дополнительных запросов."
-
-    await call.message.answer_invoice(
-        title=product["title"] + (" (Скидка 50%)" if disc else ""),
-        description=desc,
-        payload=f"prod:{prod_key}",
-        currency="XTR",
-        prices=[LabeledPrice(label=product["title"], amount=final_price)],
-    )
-    await call.answer()
-
-
-@router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-
-@router.message(F.successful_payment)
-async def successful_payment(message: Message):
-    payload = message.successful_payment.invoice_payload
-    prod_key = payload.split(":", 1)[1]
-    product = PRODUCTS[prod_key]
-    paid_stars = message.successful_payment.total_amount
-    user = await get_user(message.from_user.id)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO payments (user_id, product_key, title, stars, paid_at) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, prod_key, product["title"], paid_stars, time.time()),
-        )
-
-        if product["type"] == "sub":
-            days = product["value"]
-            base_time = max(time.time(), user["pro_until"])
-            new_pro_until = base_time + days * 86400
-            exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
-
-            await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_pro_until, message.from_user.id))
-            await db.commit()
-
-            await message.answer(
-                f"🎉 <b>Оплата прошла успешно!</b>\n"
-                f"Тариф <b>«{product['title']}»</b> активен до <b>{exp_date}</b>.\n"
-                f"Все модели разблокированы в /menu.",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            packs = product["value"]
-            await db.execute(
-                "UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?",
-                (packs, message.from_user.id),
-            )
-            await db.commit()
-
-            await message.answer(
-                f"🎉 <b>Оплата прошла успешно!</b>\n"
-                f"На твой баланс зачислен <b>пакет на +{packs} запросов</b>.\n"
-                f"Проверить остаток можно в /profile.",
-                parse_mode=ParseMode.HTML,
-            )
-
-
 # ================= ГЕНЕРАЦИЯ (ТЕКСТ И РАЗБОР ФОТО ЧЕРЕЗ ВЫБРАННЫЙ ДВИЖОК) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
     if user_id == ADMIN_ID and selected_model:
@@ -2558,7 +2782,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС, ОРИГИНАЛЬНОЕ КАЧЕСТВО) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2569,6 +2793,11 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
     )
     if not await ensure_subscribed(bot, user_id, first_msg):
         return
+
+    for m in messages:
+        if is_content_forbidden(m.caption or ""):
+            await first_msg.answer("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+            return
 
     if len(messages) > MAX_ALBUM_PHOTOS:
         await first_msg.answer(
@@ -2681,13 +2910,37 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+# ================= ОБРАБОТКА ТЕКСТА, EMAIL ДЛЯ ОПЛАТЫ, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
+
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
     text_in = message.text.strip()
 
-    if USER_INPUT_STATE.get(user_id) == "promo_activate":
+    state = USER_INPUT_STATE.get(user_id, "")
+    if state.startswith("await_pay_email:"):
+        prod_key = state.split(":", 1)[1]
+        if not EMAIL_REGEX.match(text_in):
+            await message.answer(
+                "⚠️ Некорректный адрес электронной почты. Введи правильный Email (например: <code>user@mail.ru</code>):",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"choose_pay:{prod_key}")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        USER_INPUT_STATE.pop(user_id, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET email = ? WHERE user_id = ?", (text_in.lower(), user_id))
+            await db.commit()
+
+        await send_sbp_payment_screen(message, user_id, prod_key, text_in.lower())
+        return
+
+    if state == "promo_activate":
         USER_INPUT_STATE.pop(user_id, None)
         if not await ensure_subscribed(bot, user_id, message):
             return
@@ -2845,6 +3098,10 @@ async def handle_prompt(message: Message, bot: Bot):
     if not await ensure_subscribed(bot, user_id, message):
         return
 
+    if is_content_forbidden(message.text):
+        await message.answer("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+        return
+
     model_id = user["selected_model"]
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
 
@@ -2902,6 +3159,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
         BotCommand(command="shop", description="Купить подписку или пакет запросов"),
         BotCommand(command="top", description="Еженедельный лидерборд и призы"),
+        BotCommand(command="docs", description="Документы, оферта и поддержка"),
         BotCommand(command="clear", description="Очистить память диалога"),
     ]
     await bot.set_my_commands(commands)
