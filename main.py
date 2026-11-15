@@ -11,7 +11,6 @@ import time
 from datetime import date, datetime
 from urllib.parse import quote
 import aiosqlite
-from PIL import Image
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -51,7 +50,6 @@ VIDEO_COST = 1          # Разбор 1 видео = 1 запрос
 MAX_ALBUM_PHOTOS = 4
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
-VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3.5-flash-lite").strip()
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
 USERS_PER_PAGE = 8
 
@@ -72,14 +70,6 @@ FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "deepseek-v4-flash",
-    "claude-haiku-5-5",
-]
-
-VISION_FALLBACK_MODELS = [
-    VISION_MODEL,
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gpt-5-mini",
     "claude-haiku-5-5",
 ]
 
@@ -185,33 +175,6 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in USER_QUOTA_LOCKS:
         USER_QUOTA_LOCKS[user_id] = asyncio.Lock()
     return USER_QUOTA_LOCKS[user_id]
-
-
-# ================= СЖАТИЕ ФОТО ДЛЯ МИНИМАЛЬНОГО РАСХОДА ТОКЕНОВ =================
-def compress_image_bytes(raw_bytes: bytes, max_side: int = 1024, quality: int = 75) -> str:
-    img = Image.open(io.BytesIO(raw_bytes))
-    if img.mode in ("RGBA", "P", "LA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        bg.paste(img, mask=img.split()[-1] if "A" in img.mode else None)
-        img = bg
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    w, h = img.size
-    if max(w, h) > max_side:
-        if w >= h:
-            new_w = max_side
-            new_h = max(1, int(h * (max_side / w)))
-        else:
-            new_h = max_side
-            new_w = max(1, int(w * (max_side / h)))
-        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=quality, optimize=True)
-    return base64.b64encode(out.getvalue()).decode("utf-8")
 
 
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
@@ -917,7 +880,7 @@ async def admin_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
-            [InlineKeyboardButton(text=f"⚙️ Общий движок (текст): {engine}", callback_data="adm_set_engine")],
+            [InlineKeyboardButton(text=f"⚙️ Общий движок (текст и фото): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
             [InlineKeyboardButton(text="🏆 Завершить неделю и выдать призы", callback_data="adm_finish_week")],
@@ -1899,8 +1862,8 @@ async def render_admin_text() -> str:
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
-        f"⚙️ Общий движок (текст): <code>{engine}</code>\n"
-        f"📸 Движок разбора фото: <code>{VISION_MODEL}</code> (сжатие 1024px, 1 запр.)\n"
+        f"⚙️ Общий движок (текст и фото): <code>{engine}</code>\n"
+        f"👑 Для админа: <b>работают выбранные в меню модели</b>\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
         f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
@@ -2525,7 +2488,7 @@ async def successful_payment(message: Message):
             )
 
 
-# ================= ГЕНЕРАЦИЯ (ТЕКСТ И ЭКОНОМНЫЙ РАЗБОР ФОТО) =================
+# ================= ГЕНЕРАЦИЯ (ТЕКСТ И РАЗБОР ФОТО ЧЕРЕЗ ВЫБРАННЫЙ ДВИЖОК) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
     if user_id == ADMIN_ID and selected_model:
         return [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
@@ -2560,23 +2523,15 @@ async def generate_text_response(user_id: int, selected_model: str, history: lis
     raise last_error or RuntimeError("Все модели временно недоступны")
 
 
-async def generate_photos_response(caption: str, b64_images: list[str]) -> str:
-    seen = set()
-    candidates = []
-    for m in VISION_FALLBACK_MODELS:
-        if m and m not in seen:
-            seen.add(m)
-            candidates.append(m)
+async def generate_photos_response(user_id: int, selected_model: str, caption: str, b64_images: list[str]) -> str:
+    candidates = await get_candidates_for_user(user_id, selected_model)
 
     user_content: list[dict] = [{"type": "text", "text": caption}]
     for b64_img in b64_images:
         user_content.append(
             {
                 "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{b64_img}",
-                    "detail": "auto",
-                },
+                "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"},
             }
         )
 
@@ -2591,7 +2546,7 @@ async def generate_photos_response(caption: str, b64_images: list[str]) -> str:
             response = await ai_client.chat.completions.create(
                 model=candidate_id,
                 messages=messages_payload,
-                max_tokens=1200,
+                max_tokens=2000,
             )
             content = response.choices[0].message.content
             if content:
@@ -2603,7 +2558,7 @@ async def generate_photos_response(caption: str, b64_images: list[str]) -> str:
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС, СЖАТИЕ ДО 1024px) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС, ОРИГИНАЛЬНОЕ КАЧЕСТВО) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2649,18 +2604,15 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
     wait_msg = await first_msg.answer(status_label, parse_mode=ParseMode.HTML)
 
     try:
-        loop = asyncio.get_running_loop()
         b64_list: list[str] = []
         caption = ""
         for msg in messages:
             if msg.caption and not caption:
                 caption = msg.caption
-            photo = msg.photo[-2] if len(msg.photo) >= 2 and msg.photo[-2].width >= 750 else msg.photo[-1]
+            photo = msg.photo[-1]
             file_info = await bot.get_file(photo.file_id)
             downloaded = await bot.download_file(file_info.file_path)
-            raw_bytes = downloaded.read()
-            compressed_b64 = await loop.run_in_executor(None, compress_image_bytes, raw_bytes, 1024, 75)
-            b64_list.append(compressed_b64)
+            b64_list.append(base64.b64encode(downloaded.read()).decode("utf-8"))
 
         if not caption:
             if count > 1:
@@ -2669,6 +2621,8 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
                 caption = "Подробно разбери и реши то, что изображено на фото."
 
         answer_text = await generate_photos_response(
+            user_id=user_id,
+            selected_model=user["selected_model"],
             caption=caption,
             b64_images=b64_list,
         )
