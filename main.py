@@ -988,8 +988,8 @@ async def cb_docs(call: CallbackQuery):
 
 
 # ================= ВЫБОР СПОСОБА ОПЛАТЫ (СБП / КАРТА ИЛИ TELEGRAM STARS) =================
-@router.callback_query(F.data.startswith("choose_pay:"))
-async def cb_choose_pay(call: CallbackQuery):
+@router.callback_query(F.data.startswith("pay_sbp:"))
+async def cb_pay_sbp(call: CallbackQuery):
     prod_key = call.data.split(":", 1)[1]
     product = PRODUCTS.get(prod_key)
     if not product:
@@ -998,35 +998,32 @@ async def cb_choose_pay(call: CallbackQuery):
 
     user = await get_user(call.from_user.id)
     disc = has_active_discount(user)
-    stars_price = get_product_price(product, disc)
     rub_price = get_product_rub_price(product, disc)
 
-    if product["type"] == "sub":
-        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
-    else:
-        desc = f"Пакет на {product['value']} дополнительных запросов."
+    if rub_price > MAX_RUB_TRANSACTION:
+        await call.answer(f"Сумма платежа не может превышать {MAX_RUB_TRANSACTION} ₽.", show_alert=True)
+        return
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 СБП / Банковская карта — {rub_price} ₽", callback_data=f"pay_sbp:{prod_key}")],
-            [InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars_price} ⭐", callback_data=f"pay_stars:{prod_key}")],
-            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="shop")],
+            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору оплаты", callback_data=f"choose_pay:{prod_key}")],
         ]
     )
 
     try:
         await call.message.edit_text(
-            f"🛒 <b>Оформление заказа</b>\n\n"
+            f"💳 <b>Оплата через СБП (Platega)</b>\n\n"
             f"📦 Тариф: <b>{product['title']}</b>\n"
-            f"📝 Описание: {desc}\n\n"
-            f"Выбери удобный способ оплаты:",
+            f"💰 К оплате: <b>{rub_price} ₽</b>\n\n"
+            f"<i>Платёжный шлюз СБП находится на финальной проверке банка. "
+            f"Пока шлюз подключается, ты можешь моментально оплатить тариф через Telegram Stars кнопкой ниже или написать в поддержку @{SUPPORT_USERNAME}.</i>",
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
         )
     except TelegramBadRequest:
         pass
     await call.answer()
-
 
 async def send_sbp_payment_screen(target_msg: Message, user_id: int, prod_key: str, email: str):
     product = PRODUCTS[prod_key]
