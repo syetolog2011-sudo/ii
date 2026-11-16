@@ -54,7 +54,7 @@ DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 FREE_DAILY_LIMIT = 5
 PHOTO_COST = 1          # Разбор 1 фото = 1 запрос
 VIDEO_COST = 1          # Разбор 1 видео = 1 запрос
-MAX_ALBUM_PHOTOS = 4
+MAX_ALBUM_PHOTOS = 10   # Максимум 10 фото в одном альбоме (жёстко проверяется лимит запросов)
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
@@ -62,6 +62,15 @@ USERS_PER_PAGE = 8
 
 DISCOUNT_DELAY_SECONDS = 2 * 3600      # Через 2 часа после первого сообщения
 DISCOUNT_DURATION_SECONDS = 36 * 3600  # Скидка действует 36 часов
+DISCOUNT_PERCENT = 30                  # Персональная скидка 30%
+
+REF_COMMISSION_PERCENT = 25            # 25% с каждой покупки реферала
+MIN_WITHDRAW_RUB = 100.0               # Минимальная сумма вывода 100 ₽
+STARS_TO_RUB_RATE = 1.3                # Курс 1 ⭐ = 1.3 ₽ для расчёта партнёрки
+
+MAX_CUSTOM_SUB_DAYS = 60               # Максимум 60 дней при кастомной покупке подписки
+MIN_CUSTOM_PACK_REQS = 10              # Минимум 10 запросов при кастомной покупке пакета
+MAX_CUSTOM_PACK_REQS = 500             # Максимум 500 запросов при кастомной покупке пакета
 
 # Фильтр запрещённого контента (требование банка при согласовании ИИ-проектов)
 FORBIDDEN_PATTERNS = [
@@ -166,7 +175,7 @@ for cat_data in CATEGORIES.values():
         if m["id"] not in ALL_MODELS_MAP:
             ALL_MODELS_MAP[m["id"]] = m
 
-# Цены в рублях рассчитаны по курсу 1 ⭐ ≈ 1.3 ₽ с округлением (все строго до 10 000 ₽)
+# Старые готовые цены (1 ⭐ ≈ 1.3 ₽ с округлением, всё строго до 10 000 ₽)
 PRODUCTS = {
     "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 59, "rub": 79, "value": 1},
     "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 149, "rub": 199, "value": 7},
@@ -205,11 +214,130 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     return USER_QUOTA_LOCKS[user_id]
 
 
+# ================= РАСЧЁТ ЦЕН (ГОТОВЫХ И КАСТОМНЫХ) СО СКИДКОЙ 30% =================
+def has_active_discount(user: dict) -> bool:
+    return (user.get("discount_until") or 0) > time.time()
+
+
+def apply_discount(base_val: int, discount_active: bool, min_val: int = 1) -> int:
+    if discount_active:
+        return max(min_val, round(base_val * (100 - DISCOUNT_PERCENT) / 100))
+    return base_val
+
+
+def get_product_price(product: dict, discount_active: bool) -> int:
+    return apply_discount(product["stars"], discount_active, min_val=1)
+
+
+def get_product_rub_price(product: dict, discount_active: bool) -> int:
+    return apply_discount(product["rub"], discount_active, min_val=10)
+
+
+def calc_custom_sub_price(days: int, discount_active: bool) -> tuple[int, int]:
+    """Возвращает (rub_price, stars_price) для кастомного срока подписки от 1 до 60 дней."""
+    if days == 1:
+        base_rub, base_stars = 79, 59
+    elif days == 7:
+        base_rub, base_stars = 199, 149
+    elif days == 30:
+        base_rub, base_stars = 449, 349
+    elif days < 7:
+        base_rub = days * 65
+        base_stars = days * 50
+    elif days < 30:
+        base_rub = days * 25
+        base_stars = days * 19
+    else:
+        base_rub = days * 15
+        base_stars = days * 12
+
+    return apply_discount(base_rub, discount_active, 10), apply_discount(base_stars, discount_active, 1)
+
+
+def calc_custom_pack_price(reqs: int, discount_active: bool) -> tuple[int, int]:
+    """Возвращает (rub_price, stars_price) для кастомного пакета от 10 до 500 запросов."""
+    if reqs == 30:
+        base_rub, base_stars = 99, 79
+    elif reqs == 100:
+        base_rub, base_stars = 259, 199
+    elif reqs == 300:
+        base_rub, base_stars = 589, 449
+    elif reqs < 100:
+        base_rub = round(reqs * 3.3)
+        base_stars = round(reqs * 2.6)
+    elif reqs < 300:
+        base_rub = round(reqs * 2.5)
+        base_stars = round(reqs * 2.0)
+    else:
+        base_rub = round(reqs * 1.9)
+        base_stars = round(reqs * 1.5)
+
+    return apply_discount(base_rub, discount_active, 10), apply_discount(base_stars, discount_active, 1)
+
+
+def resolve_order_details(order_code: str, discount_active: bool) -> dict | None:
+    """
+    Универсальный парсер заказа:
+    - 'prod:sub_trial' / 'prod:pack_30' (готовые товары)
+    - 'csub:14' (своё кол-во дней подписки)
+    - 'cpack:50' (своё кол-во запросов)
+    """
+    if order_code.startswith("prod:"):
+        prod_key = order_code.split(":", 1)[1]
+        p = PRODUCTS.get(prod_key)
+        if not p:
+            return None
+        return {
+            "order_code": order_code,
+            "type": p["type"],
+            "title": p["title"],
+            "value": p["value"],
+            "rub": get_product_rub_price(p, discount_active),
+            "stars": get_product_price(p, discount_active),
+            "back_cb": "shop:subs" if p["type"] == "sub" else "shop:packs",
+        }
+    elif order_code.startswith("csub:"):
+        val_s = order_code.split(":", 1)[1]
+        if not val_s.isdigit():
+            return None
+        days = int(val_s)
+        if not (1 <= days <= MAX_CUSTOM_SUB_DAYS):
+            return None
+        rub_p, stars_p = calc_custom_sub_price(days, discount_active)
+        return {
+            "order_code": order_code,
+            "type": "sub",
+            "title": f"Подписка на {days} дн.",
+            "value": days,
+            "rub": rub_p,
+            "stars": stars_p,
+            "back_cb": "shop:subs",
+        }
+    elif order_code.startswith("cpack:"):
+        val_s = order_code.split(":", 1)[1]
+        if not val_s.isdigit():
+            return None
+        reqs = int(val_s)
+        if not (MIN_CUSTOM_PACK_REQS <= reqs <= MAX_CUSTOM_PACK_REQS):
+            return None
+        rub_p, stars_p = calc_custom_pack_price(reqs, discount_active)
+        return {
+            "order_code": order_code,
+            "type": "pack",
+            "title": f"Пакет +{reqs} запросов",
+            "value": reqs,
+            "rub": rub_p,
+            "stars": stars_p,
+            "back_cb": "shop:packs",
+        }
+    return None
+
+
 # ================= ОЧИСТКА И ФОРМАТИРОВАНИЕ ОТВЕТОВ НЕЙРОСЕТИ =================
 def format_ai_response(raw_text: str) -> tuple[str, str]:
     text = raw_text.replace("\r\n", "\n")
 
-    text = re.sub(r"\\\[\vert{}\\\]|\\\(\vert{}\\\)", "", text)
+    text = re.sub(r"\\\[|\\\]|\\\(|\\\)", "", text)
     text = text.replace("$$", "")
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", text)
     text = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", text)
@@ -251,30 +379,6 @@ async def send_formatted_answer(message: Message, raw_text: str):
             await message.answer(chunk_plain)
 
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ НЕДЕЛИ И ЦЕН =================
-def current_week_key() -> str:
-    iso = date.today().isocalendar()
-    return f"{iso.year}-W{iso.week:02d}"
-
-
-def has_active_discount(user: dict) -> bool:
-    return (user.get("discount_until") or 0) > time.time()
-
-
-def get_product_price(product: dict, discount_active: bool) -> int:
-    base = product["stars"]
-    if discount_active:
-        return max(1, round(base * 0.5))
-    return base
-
-
-def get_product_rub_price(product: dict, discount_active: bool) -> int:
-    base = product["rub"]
-    if discount_active:
-        return max(10, round(base * 0.5))
-    return base
-
-
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
     db_dir = os.path.dirname(os.path.abspath(DB_PATH))
@@ -301,6 +405,8 @@ async def init_db():
                 extra_requests INTEGER DEFAULT 0,
                 referred_by INTEGER DEFAULT 0,
                 ref_rewarded INTEGER DEFAULT 0,
+                ref_balance REAL DEFAULT 0,
+                ref_total_earned REAL DEFAULT 0,
                 total_requests INTEGER DEFAULT 0,
                 visited_models INTEGER DEFAULT 0,
                 discount_until REAL DEFAULT 0,
@@ -315,6 +421,8 @@ async def init_db():
             ("username", "TEXT DEFAULT ''"),
             ("extra_requests", "INTEGER DEFAULT 0"),
             ("ref_rewarded", "INTEGER DEFAULT 0"),
+            ("ref_balance", "REAL DEFAULT 0"),
+            ("ref_total_earned", "REAL DEFAULT 0"),
             ("total_requests", "INTEGER DEFAULT 0"),
             ("visited_models", "INTEGER DEFAULT 0"),
             ("discount_until", "REAL DEFAULT 0"),
@@ -348,11 +456,13 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS weekly_refs (
-                week_key TEXT,
-                referrer_id INTEGER,
-                count INTEGER DEFAULT 0,
-                PRIMARY KEY (week_key, referrer_id)
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                requisites TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at REAL
             )
         """)
         await db.execute("""
@@ -388,10 +498,6 @@ async def init_db():
         await db.execute(
             "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('engine_model', ?)",
             (DEFAULT_ENGINE_MODEL,),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('active_week', ?)",
-            (current_week_key(),),
         )
         await db.commit()
 
@@ -596,31 +702,65 @@ async def reward_referrer_if_needed(user_id: int, bot: Bot):
             return
         ref_id, rewarded = row["referred_by"], row["ref_rewarded"]
         if ref_id and not rewarded and ref_id != user_id:
-            wk = current_week_key()
             await db.execute("UPDATE users SET ref_rewarded = 1 WHERE user_id = ?", (user_id,))
             await db.execute("UPDATE users SET bonus_limit = bonus_limit + 2 WHERE user_id = ?", (ref_id,))
-            await db.execute(
-                """
-                INSERT INTO weekly_refs (week_key, referrer_id, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(week_key, referrer_id) DO UPDATE SET count = count + 1
-                """,
-                (wk, ref_id),
-            )
             await db.commit()
             try:
                 await bot.send_message(
                     ref_id,
                     "🎉 По твоей ссылке подписался на канал новый друг!\n"
                     "• Начислено <b>+2 запроса в день</b>\n"
-                    "• Засчитан <b>+1 балл</b> в еженедельный лидерборд (/top)!",
+                    f"• Ты будешь получать <b>{REF_COMMISSION_PERCENT}%</b> со всех его покупок в боте!",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
 
 
-# ================= ФОНОВЫЙ ПЛАНИРОВЩИК: СКИДКА 50% НА 36 ЧАСОВ ЧЕРЕЗ 2 ЧАСА =================
+async def credit_referral_commission(buyer_id: int, purchase_rub_amount: float, item_title: str, bot: Bot):
+    """Начисляет 25% в рублях пригласившему пользователю с любой покупки."""
+    if purchase_rub_amount <= 0:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT referred_by FROM users WHERE user_id = ?", (buyer_id,)) as cur:
+            row = await cur.fetchone()
+        if not row or not row["referred_by"] or row["referred_by"] == buyer_id:
+            return
+
+        ref_id = row["referred_by"]
+        reward_rub = round(purchase_rub_amount * (REF_COMMISSION_PERCENT / 100.0), 2)
+        if reward_rub <= 0:
+            return
+
+        await db.execute(
+            """
+            UPDATE users
+            SET ref_balance = COALESCE(ref_balance, 0) + ?,
+                ref_total_earned = COALESCE(ref_total_earned, 0) + ?
+            WHERE user_id = ?
+            """,
+            (reward_rub, reward_rub, ref_id),
+        )
+        await db.commit()
+
+        async with db.execute("SELECT ref_balance FROM users WHERE user_id = ?", (ref_id,)) as cur2:
+            r2 = await cur2.fetchone()
+            new_bal = (r2["ref_balance"] if r2 else reward_rub) or 0.0
+
+        try:
+            await bot.send_message(
+                ref_id,
+                f"💸 <b>Партнёрское начисление +{reward_rub:.2f} ₽!</b>\n\n"
+                f"Твой реферал оплатил тариф <b>«{html.escape(item_title)}»</b>.\n"
+                f"💰 Твой реферальный баланс: <b>{new_bal:.2f} ₽</b> (вывод от {int(MIN_WITHDRAW_RUB)} ₽ в разделе /ref).",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+# ================= ФОНОВЫЙ ПЛАНИРОВЩИК: СКИДКА 30% НА 36 ЧАСОВ ЧЕРЕЗ 2 ЧАСА =================
 async def delayed_discount_watcher(bot: Bot):
     while True:
         try:
@@ -652,23 +792,23 @@ async def delayed_discount_watcher(bot: Bot):
                     await db.commit()
 
                     offer_text = (
-                        "🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА 50% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
-                        "Мы снизили цены вдвое на все тарифы и пакеты запросов специально для тебя на ближайшие <b>36 часов</b>:\n\n"
+                        f"🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА {DISCOUNT_PERCENT}% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
+                        f"Мы снизили цены на <b>{DISCOUNT_PERCENT}%</b> на все подписки и пакеты запросов специально для тебя на ближайшие <b>36 часов</b>:\n\n"
                         "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
                         f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], True)} ⭐)\n"
                         f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], True)} ⭐)\n"
                         f"• Премиум 30 дней: <s>449 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], True)} ⭐)\n\n"
-                        "⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>\n"
+                        "⚡ <b>Пакеты запросов (не сгорают):</b>\n"
                         f"• +30 запросов: <s>99 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_30'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_30'], True)} ⭐)\n"
                         f"• +100 запросов: <s>259 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_100'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_100'], True)} ⭐)\n"
                         f"• +300 запросов: <s>589 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_300'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_300'], True)} ⭐)\n\n"
-                        "👇 Жми на любой тариф прямо сейчас, пока действует акция:"
+                        "👇 Выбери раздел в магазине прямо сейчас, пока действует скидка:"
                     )
                     try:
                         await bot.send_message(
                             uid,
                             offer_text,
-                            reply_markup=shop_kb(discount_active=True),
+                            reply_markup=shop_main_kb(),
                             parse_mode=ParseMode.HTML,
                         )
                     except Exception:
@@ -678,87 +818,6 @@ async def delayed_discount_watcher(bot: Bot):
         except Exception:
             pass
         await asyncio.sleep(60)
-
-
-# ================= ЕЖЕНЕДЕЛЬНЫЙ ЛИДЕРБОРД И НАГРАДЫ =================
-async def distribute_weekly_rewards(bot: Bot, week_to_close: str) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """
-            SELECT w.referrer_id, w.count, u.full_name, u.pro_until
-            FROM weekly_refs w
-            LEFT JOIN users u ON u.user_id = w.referrer_id
-            WHERE w.week_key = ? AND w.count > 0
-            ORDER BY w.count DESC
-            LIMIT 10
-            """,
-            (week_to_close,),
-        ) as cur:
-            winners = await cur.fetchall()
-
-        if not winners:
-            return f"Неделя {week_to_close}: участников в топе не было."
-
-        report_lines = [f"🏆 <b>Итоги лидерборда за неделю {week_to_close}:</b>\n"]
-        now = time.time()
-
-        for idx, w in enumerate(winners, start=1):
-            uid = w["referrer_id"]
-            cnt = w["count"]
-            name = html.escape(w["full_name"] or str(uid))
-
-            if idx == 1:
-                days = 30
-                new_until = max(now, w["pro_until"] or 0) + days * 86400
-                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, uid))
-                prize_text = "👑 Подписка на 30 дней"
-            elif idx == 2:
-                days = 15
-                new_until = max(now, w["pro_until"] or 0) + days * 86400
-                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, uid))
-                prize_text = "🥈 Подписка на 15 дней"
-            elif idx == 3:
-                days = 7
-                new_until = max(now, w["pro_until"] or 0) + days * 86400
-                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_until, uid))
-                prize_text = "🥉 Подписка на 7 дней"
-            else:
-                await db.execute("UPDATE users SET extra_requests = extra_requests + 20 WHERE user_id = ?", (uid,))
-                prize_text = "⚡ Пакет +20 запросов"
-
-            report_lines.append(f"{idx}. <b>{name}</b> ({cnt} реф.) — {prize_text}")
-
-            try:
-                await bot.send_message(
-                    uid,
-                    f"🏆 <b>Поздравляем! Ты занял {idx} место в недельном лидерборде!</b>\n"
-                    f"Приглашено друзей: <b>{cnt}</b>\n"
-                    f"Твоя награда: <b>{prize_text}</b> уже зачислена на аккаунт!",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-
-        await db.commit()
-        return "\n".join(report_lines)
-
-
-async def weekly_leaderboard_watcher(bot: Bot):
-    while True:
-        try:
-            saved_week = await get_setting("active_week", current_week_key())
-            now_week = current_week_key()
-            if saved_week != now_week:
-                report = await distribute_weekly_rewards(bot, saved_week)
-                await set_setting("active_week", now_week)
-                try:
-                    await bot.send_message(ADMIN_ID, report, parse_mode=ParseMode.HTML)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        await asyncio.sleep(600)
 
 
 # ================= ПРОВЕРКА ПОДПИСКИ НА КАНАЛ =================
@@ -828,11 +887,10 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
-            InlineKeyboardButton(text="🏆 Топ недели", callback_data="leaderboard"),
+            InlineKeyboardButton(text=f"💸 Партнёрка ({REF_COMMISSION_PERCENT}%)", callback_data="ref_info"),
         ],
         [
-            InlineKeyboardButton(text="👥 +2 за друга", callback_data="ref_info"),
-            InlineKeyboardButton(text="📄 Документы", callback_data="docs"),
+            InlineKeyboardButton(text="📄 Документы и поддержка", callback_data="docs"),
         ],
     ]
     if user_id == ADMIN_ID:
@@ -865,31 +923,58 @@ def models_in_category_kb(cat_key: str, current_model: str, pro_active: bool) ->
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def shop_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
-    buttons = []
-    for key, p in PRODUCTS.items():
-        stars_price = get_product_price(p, discount_active)
-        rub_price = get_product_rub_price(p, discount_active)
-        if discount_active:
-            label = f"🔥 {p['title']} — {rub_price} ₽ / {stars_price} ⭐"
-        else:
-            icon = "👑" if p["type"] == "sub" else "⚡"
-            label = f"{icon} {p['title']} — {rub_price} ₽ / {stars_price} ⭐"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"choose_pay:{key}")])
+def shop_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Подписка (безлимит PRO)", callback_data="shop:subs")],
+            [InlineKeyboardButton(text="⚡ Пакеты запросов", callback_data="shop:packs")],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")],
+        ]
+    )
 
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")])
+
+def render_shop_main_text(user: dict) -> str:
+    disc = has_active_discount(user)
+    disc_line = ""
+    if disc:
+        exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
+        disc_line = f"🔥 <b>АКТИВНА ПЕРСОНАЛЬНАЯ СКИДКА {DISCOUNT_PERCENT}% (до {exp})!</b>\n\n"
+
+    return (
+        f"⭐ <b>Магазин подписок и пакетов</b>\n\n"
+        f"{disc_line}"
+        "Выбери, что хочешь приобрести:\n\n"
+        "👑 <b>Подписка</b> — полный безлимит на все PRO-модели (GPT-6, Claude 5, Gemini Pro, Grok) на выбранное количество дней.\n"
+        "⚡ <b>Пакеты запросов</b> — дополнительные запросы, которые не сгорают и расходуются после дневного лимита."
+    )
+
+
+def shop_subs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    for key in ("sub_trial", "sub_standard", "sub_premium"):
+        p = PRODUCTS[key]
+        sp = get_product_price(p, discount_active)
+        rp = get_product_rub_price(p, discount_active)
+        prefix = "🔥" if discount_active else "👑"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{prefix} {p['title']} — {rp} ₽ / {sp} ⭐",
+                callback_data=f"choose_pay:prod:{key}",
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text=f"✏️ Выбрать своё кол-во дней (1–{MAX_CUSTOM_SUB_DAYS})", callback_data="custom_sub_enter")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def render_shop_text(user: dict) -> str:
+def render_shop_subs_text(user: dict) -> str:
     disc = has_active_discount(user)
+    lines = ["👑 <b>Подписки (безлимит на все PRO-модели)</b>\n"]
     if disc:
         exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        header = f"🔥 <b>АКТИВНА ПЕРСОНАЛЬНАЯ СКИДКА 50% (до {exp})!</b>\nВсе цены ниже снижены вдвое:\n\n"
-    else:
-        header = "⭐ <b>Магазин подписок и пакетов</b>\n\n"
+        lines.append(f"🔥 <b>Скидка {DISCOUNT_PERCENT}% активна до {exp}!</b>\n")
 
-    lines = [header, "👑 <b>Безлимитные подписки (все PRO-модели):</b>"]
     for key in ("sub_trial", "sub_standard", "sub_premium"):
         p = PRODUCTS[key]
         sp = get_product_price(p, disc)
@@ -899,7 +984,41 @@ def render_shop_text(user: dict) -> str:
         else:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
-    lines.append("\n⚡ <b>Пакеты запросов (расходуются после дневного лимита):</b>")
+    lines.append(f"\nТакже ты можешь указать <b>любой свой срок от 1 до {MAX_CUSTOM_SUB_DAYS} дней</b> кнопкой ниже.")
+    return "\n".join(lines)
+
+
+def shop_packs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    for key in ("pack_30", "pack_100", "pack_300"):
+        p = PRODUCTS[key]
+        sp = get_product_price(p, discount_active)
+        rp = get_product_rub_price(p, discount_active)
+        prefix = "🔥" if discount_active else "⚡"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{prefix} {p['title']} — {rp} ₽ / {sp} ⭐",
+                callback_data=f"choose_pay:prod:{key}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"✏️ Выбрать своё кол-во запросов ({MIN_CUSTOM_PACK_REQS}–{MAX_CUSTOM_PACK_REQS})",
+            callback_data="custom_pack_enter",
+        )
+    ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="shop")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def render_shop_packs_text(user: dict) -> str:
+    disc = has_active_discount(user)
+    lines = ["⚡ <b>Пакеты запросов (расходуются после дневного лимита)</b>\n"]
+    if disc:
+        exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
+        lines.append(f"🔥 <b>Скидка {DISCOUNT_PERCENT}% активна до {exp}!</b>\n")
+
     for key in ("pack_30", "pack_100", "pack_300"):
         p = PRODUCTS[key]
         sp = get_product_price(p, disc)
@@ -909,6 +1028,9 @@ def render_shop_text(user: dict) -> str:
         else:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
+    lines.append(
+        f"\nТакже ты можешь указать <b>любое своё количество от {MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS} запросов</b> кнопкой ниже."
+    )
     return "\n".join(lines)
 
 
@@ -917,7 +1039,7 @@ def profile_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🎟 Активировать промокод", callback_data="promo_enter")],
             [InlineKeyboardButton(text="⭐ Купить подписку или пакет", callback_data="shop")],
-            [InlineKeyboardButton(text="🏆 Лидерборд недели", callback_data="leaderboard")],
+            [InlineKeyboardButton(text=f"💸 Партнёрка ({REF_COMMISSION_PERCENT}%) и вывод", callback_data="ref_info")],
             [InlineKeyboardButton(text="🧹 Сброс чата", callback_data="clear_chat")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")],
         ]
@@ -926,14 +1048,19 @@ def profile_kb() -> InlineKeyboardMarkup:
 
 async def admin_kb() -> InlineKeyboardMarkup:
     engine = await get_engine_model()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'") as cur:
+            pending_w = (await cur.fetchone())[0]
+
+    w_label = f"💸 Заявки на вывод ({pending_w} шт.)" if pending_w > 0 else "💸 Заявки на вывод (0)"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
+            [InlineKeyboardButton(text=w_label, callback_data="adm_withdrawals")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text=f"⚙️ Общий движок (текст и фото): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
             [InlineKeyboardButton(text="📋 Список промокодов", callback_data="adm_promo_list")],
-            [InlineKeyboardButton(text="🏆 Завершить неделю и выдать призы", callback_data="adm_finish_week")],
             [InlineKeyboardButton(text="👑 Выдать Премиум себе (30 дн.)", callback_data="adm_self_pro")],
             [InlineKeyboardButton(text="💾 Скачать бэкап базы вручную", callback_data="adm_backup_now")],
             [InlineKeyboardButton(text="🔌 Проверить живые модели API", callback_data="adm_check_api")],
@@ -984,75 +1111,152 @@ async def cb_docs(call: CallbackQuery):
     await call.answer()
 
 
-# ================= ВЫБОР СПОСОБА ОПЛАТЫ (СБП ИЛИ TELEGRAM STARS) =================
-@router.callback_query(F.data.startswith("choose_pay:"))
-async def cb_choose_pay(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    product = PRODUCTS.get(prod_key)
-    if not product:
-        await call.answer("Товар не найден", show_alert=True)
+# ================= МАГАЗИН: РАЗДЕЛЫ, КАСТОМНЫЙ ВВОД И ОПЛАТА =================
+@router.callback_query(F.data == "shop")
+async def cb_shop(call: CallbackQuery, bot: Bot):
+    USER_INPUT_STATE.pop(call.from_user.id, None)
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
         return
-
-    user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    stars_price = get_product_price(product, disc)
-    rub_price = get_product_rub_price(product, disc)
-
-    if product["type"] == "sub":
-        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
-    else:
-        desc = f"Пакет на {product['value']} дополнительных запросов."
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 СБП — {rub_price} ₽", callback_data=f"pay_sbp:{prod_key}")],
-            [InlineKeyboardButton(text=f"⭐ Telegram Stars — {stars_price} ⭐", callback_data=f"pay_stars:{prod_key}")],
-            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="shop")],
-        ]
-    )
-
+    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     try:
-        await call.message.edit_text(
-            f"🛒 <b>Оформление заказа</b>\n\n"
-            f"📦 Тариф: <b>{product['title']}</b>\n"
-            f"📝 Описание: {desc}\n\n"
-            f"Чем вы хотите оплатить?",
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-        )
+        await call.message.edit_text(render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
         pass
     await call.answer()
 
 
+@router.callback_query(F.data == "shop:subs")
+async def cb_shop_subs(call: CallbackQuery, bot: Bot):
+    USER_INPUT_STATE.pop(call.from_user.id, None)
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
+        return
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    try:
+        await call.message.edit_text(render_shop_subs_text(user), reply_markup=shop_subs_kb(disc), parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "shop:packs")
+async def cb_shop_packs(call: CallbackQuery, bot: Bot):
+    USER_INPUT_STATE.pop(call.from_user.id, None)
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
+        return
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    try:
+        await call.message.edit_text(render_shop_packs_text(user), reply_markup=shop_packs_kb(disc), parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "custom_sub_enter")
+async def cb_custom_sub_enter(call: CallbackQuery):
+    USER_INPUT_STATE[call.from_user.id] = "await_custom_sub_days"
+    await call.message.edit_text(
+        f"👑 <b>Свой срок подписки PRO</b>\n\n"
+        f"Введи количество дней от <b>1 до {MAX_CUSTOM_SUB_DAYS}</b> одним числом (например: <code>2</code>, <code>5</code> или <code>14</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="shop:subs")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "custom_pack_enter")
+async def cb_custom_pack_enter(call: CallbackQuery):
+    USER_INPUT_STATE[call.from_user.id] = "await_custom_pack_reqs"
+    await call.message.edit_text(
+        f"⚡ <b>Свой пакет запросов</b>\n\n"
+        f"Введи нужное количество запросов от <b>{MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS}</b> одним числом (например: <code>20</code> или <code>50</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="shop:packs")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+async def send_payment_method_choice(target_msg: Message, user_id: int, order_code: str, edit: bool = True):
+    user = await get_user(user_id)
+    disc = has_active_discount(user)
+    order = resolve_order_details(order_code, disc)
+    if not order:
+        if edit:
+            await target_msg.edit_text("⚠️ Товар не найден.", reply_markup=shop_main_kb())
+        else:
+            await target_msg.answer("⚠️ Товар не найден.", reply_markup=shop_main_kb())
+        return
+
+    if order["type"] == "sub":
+        desc = f"Безлимитный доступ ко всем PRO-моделям на {order['value']} дн."
+    else:
+        desc = f"Пакет на {order['value']} дополнительных запросов."
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 СБП — {order['rub']} ₽", callback_data=f"pay_sbp:{order_code}")],
+            [InlineKeyboardButton(text=f"⭐ Telegram Stars — {order['stars']} ⭐", callback_data=f"pay_stars:{order_code}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data=order["back_cb"])],
+        ]
+    )
+
+    text = (
+        f"🛒 <b>Оформление заказа</b>\n\n"
+        f"📦 Тариф: <b>{order['title']}</b>\n"
+        f"📝 Описание: {desc}\n\n"
+        f"Чем вы хотите оплатить?"
+    )
+
+    if edit:
+        try:
+            await target_msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest:
+            pass
+    else:
+        await target_msg.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("choose_pay:"))
+async def cb_choose_pay(call: CallbackQuery):
+    order_code = call.data.split(":", 1)[1]
+    await send_payment_method_choice(call.message, call.from_user.id, order_code, edit=True)
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("pay_sbp:"))
 async def cb_pay_sbp(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    product = PRODUCTS.get(prod_key)
-    if not product:
+    order_code = call.data.split(":", 1)[1]
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    order = resolve_order_details(order_code, disc)
+    if not order:
         await call.answer("Товар не найден", show_alert=True)
         return
 
-    user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    rub_price = get_product_rub_price(product, disc)
-
-    if rub_price > MAX_RUB_TRANSACTION:
+    if order["rub"] > MAX_RUB_TRANSACTION:
         await call.answer(f"Сумма платежа не может превышать {MAX_RUB_TRANSACTION} ₽.", show_alert=True)
         return
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{prod_key}")],
-            [InlineKeyboardButton(text="⬅️ Назад к выбору оплаты", callback_data=f"choose_pay:{prod_key}")],
+            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{order_code}")],
+            [InlineKeyboardButton(text="⬅️ Назад к выбору оплаты", callback_data=f"choose_pay:{order_code}")],
         ]
     )
 
     try:
         await call.message.edit_text(
             f"💳 <b>Оплата через СБП (Platega)</b>\n\n"
-            f"📦 Тариф: <b>{product['title']}</b>\n"
-            f"💰 К оплате: <b>{rub_price} ₽</b>\n\n"
+            f"📦 Тариф: <b>{order['title']}</b>\n"
+            f"💰 К оплате: <b>{order['rub']} ₽</b>\n\n"
             f"<i>Платёжный шлюз СБП находится на финальной проверке банка. "
             f"Пока шлюз подключается, ты можешь моментально оплатить тариф через Telegram Stars кнопкой ниже или написать в поддержку @{SUPPORT_USERNAME}.</i>",
             reply_markup=kb,
@@ -1065,27 +1269,25 @@ async def cb_pay_sbp(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay_stars:"))
 async def cb_pay_stars(call: CallbackQuery):
-    prod_key = call.data.split(":", 1)[1]
-    product = PRODUCTS.get(prod_key)
-    if not product:
+    order_code = call.data.split(":", 1)[1]
+    user = await get_user(call.from_user.id)
+    disc = has_active_discount(user)
+    order = resolve_order_details(order_code, disc)
+    if not order:
         await call.answer("Товар не найден", show_alert=True)
         return
 
-    user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    final_price = get_product_price(product, disc)
-
-    if product["type"] == "sub":
-        desc = f"Безлимитный доступ ко всем PRO-моделям на {product['value']} дн."
+    if order["type"] == "sub":
+        desc = f"Безлимитный доступ ко всем PRO-моделям на {order['value']} дн."
     else:
-        desc = f"Пакет на {product['value']} дополнительных запросов."
+        desc = f"Пакет на {order['value']} дополнительных запросов."
 
     await call.message.answer_invoice(
-        title=product["title"] + (" (Скидка 50%)" if disc else ""),
+        title=order["title"] + (f" (Скидка {DISCOUNT_PERCENT}%)" if disc else ""),
         description=desc,
-        payload=f"prod:{prod_key}",
+        payload=f"ord:{order_code}",
         currency="XTR",
-        prices=[LabeledPrice(label=product["title"], amount=final_price)],
+        prices=[LabeledPrice(label=order["title"], amount=order["stars"])],
     )
     await call.answer()
 
@@ -1096,21 +1298,40 @@ async def pre_checkout(query: PreCheckoutQuery):
 
 
 @router.message(F.successful_payment)
-async def successful_payment(message: Message):
+async def successful_payment(message: Message, bot: Bot):
     payload = message.successful_payment.invoice_payload
-    prod_key = payload.split(":", 1)[1]
-    product = PRODUCTS[prod_key]
     paid_stars = message.successful_payment.total_amount
     user = await get_user(message.from_user.id)
+    disc = has_active_discount(user)
+
+    if payload.startswith("ord:"):
+        order_code = payload.split(":", 1)[1]
+    elif payload.startswith("prod:"):
+        order_code = payload
+    else:
+        order_code = payload
+
+    order = resolve_order_details(order_code, disc)
+    if not order:
+        order = {
+            "order_code": order_code,
+            "type": "pack",
+            "title": f"Оплата {paid_stars} ⭐",
+            "value": paid_stars,
+            "rub": round(paid_stars * STARS_TO_RUB_RATE),
+            "stars": paid_stars,
+        }
+
+    rub_equivalent = round(paid_stars * STARS_TO_RUB_RATE, 2)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO payments (user_id, product_key, title, stars, paid_at) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, prod_key, product["title"], paid_stars, time.time()),
+            (message.from_user.id, order["order_code"], order["title"], paid_stars, time.time()),
         )
 
-        if product["type"] == "sub":
-            days = product["value"]
+        if order["type"] == "sub":
+            days = order["value"]
             base_time = max(time.time(), user["pro_until"])
             new_pro_until = base_time + days * 86400
             exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
@@ -1120,12 +1341,12 @@ async def successful_payment(message: Message):
 
             await message.answer(
                 f"🎉 <b>Оплата прошла успешно!</b>\n"
-                f"Тариф <b>«{product['title']}»</b> активен до <b>{exp_date}</b>.\n"
+                f"Тариф <b>«{order['title']}»</b> активен до <b>{exp_date}</b>.\n"
                 f"Все модели разблокированы в /menu.",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            packs = product["value"]
+            packs = order["value"]
             await db.execute(
                 "UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?",
                 (packs, message.from_user.id),
@@ -1138,6 +1359,231 @@ async def successful_payment(message: Message):
                 f"Проверить остаток можно в /profile.",
                 parse_mode=ParseMode.HTML,
             )
+
+    await credit_referral_commission(message.from_user.id, rub_equivalent, order["title"], bot)
+
+
+# ================= ПАРТНЁРСКАЯ ПРОГРАММА (25% С ПОКУПОК + ВЫВОД ОТ 100 ₽) =================
+async def render_partner_text(user_id: int, bot_username: str) -> tuple[str, InlineKeyboardMarkup]:
+    user = await get_user(user_id)
+    ref_bal = user.get("ref_balance") or 0.0
+    ref_total = user.get("ref_total_earned") or 0.0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE referred_by = ? AND ref_rewarded = 1",
+            (user_id,),
+        ) as cur:
+            invited_count = (await cur.fetchone())[0]
+
+    base_tg = "https" + "://" + "t.me"
+    ref_link = f"{base_tg}/{bot_username}?start={user_id}"
+    share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini! Решает задачи по фото.")
+    share_url = f"{base_tg}/share/url?url={quote(ref_link)}&text={share_text}"
+
+    buttons = [
+        [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
+    ]
+
+    try:
+        from aiogram.types import CopyTextButton
+        buttons.append([
+            InlineKeyboardButton(
+                text="📋 Скопировать ссылку",
+                copy_text=CopyTextButton(text=ref_link),
+            )
+        ])
+    except Exception:
+        pass
+
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"💸 Вывести средства ({ref_bal:.2f} ₽)",
+            callback_data="withdraw_start",
+        )
+    ])
+    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")])
+
+    text = (
+        f"💸 <b>Партнёрская программа ({REF_COMMISSION_PERCENT}% с покупок)</b>\n\n"
+        f"Приглашай друзей и одноклассников по своей ссылке! За каждого друга, который запустит бота и подпишется на канал:\n"
+        f"• Твой дневной лимит навсегда вырастет на <b>+2 запроса</b>\n"
+        f"• Ты будешь получать <b>{REF_COMMISSION_PERCENT}% в рублях</b> с каждой его оплаты в боте!\n\n"
+        f"📊 <b>Твоя статистика:</b>\n"
+        f"👥 Приглашено друзей: <b>{invited_count} чел.</b>\n"
+        f"💰 Доступно к выводу: <b>{ref_bal:.2f} ₽</b>\n"
+        f"📈 Заработано за всё время: <b>{ref_total:.2f} ₽</b>\n"
+        f"🏦 Минимальная сумма вывода: <b>{int(MIN_WITHDRAW_RUB)} ₽</b> (СБП / карта)\n\n"
+        f"🔗 Твоя ссылка:\n<code>{ref_link}</code>"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("ref"))
+async def cmd_ref(message: Message, bot: Bot):
+    USER_INPUT_STATE.pop(message.from_user.id, None)
+    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
+    if not await ensure_subscribed(bot, message.from_user.id, message):
+        return
+    me = await bot.get_me()
+    text, kb = await render_partner_text(message.from_user.id, me.username or "AetherNeural_bot")
+    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "ref_info")
+async def cb_ref_info(call: CallbackQuery, bot: Bot):
+    USER_INPUT_STATE.pop(call.from_user.id, None)
+    if not await ensure_subscribed(bot, call.from_user.id, call.message):
+        await call.answer()
+        return
+    me = await bot.get_me()
+    text, kb = await render_partner_text(call.from_user.id, me.username or "AetherNeural_bot")
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await call.answer()
+
+
+@router.callback_query(F.data == "withdraw_start")
+async def cb_withdraw_start(call: CallbackQuery):
+    user = await get_user(call.from_user.id)
+    bal = user.get("ref_balance") or 0.0
+    if bal < MIN_WITHDRAW_RUB:
+        await call.answer(
+            f"❌ Минимальная сумма вывода — {int(MIN_WITHDRAW_RUB)} ₽. Сейчас на балансе: {bal:.2f} ₽.",
+            show_alert=True,
+        )
+        return
+
+    USER_INPUT_STATE[call.from_user.id] = "await_withdraw_reqs"
+    await call.message.edit_text(
+        f"💸 <b>Заявка на вывод средств</b>\n\n"
+        f"Сумма к выводу: <b>{bal:.2f} ₽</b>\n\n"
+        f"Отправь одним сообщением свои реквизиты для перевода:\n"
+        f"• Номер телефона (СБП) или номер карты\n"
+        f"• Название банка (например: <code>+79991234567 Т-Банк</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="ref_info")]]
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+# ================= АДМИН: УПРАВЛЕНИЕ ЗАЯВКАМИ НА ВЫВОД =================
+async def render_withdrawals_admin() -> tuple[str, InlineKeyboardMarkup]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT w.*, u.full_name, u.username
+            FROM withdrawals w
+            LEFT JOIN users u ON u.user_id = w.user_id
+            WHERE w.status = 'pending'
+            ORDER BY w.id ASC
+            LIMIT 10
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        return (
+            "💸 <b>Заявки на вывод средств</b>\n\n<i>Активных заявок пока нет.</i>",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]]),
+        )
+
+    lines = ["💸 <b>Активные заявки на вывод (ожидают выплаты):</b>\n"]
+    buttons = []
+    for r in rows:
+        wid = r["id"]
+        uid = r["user_id"]
+        amt = r["amount"]
+        reqs = html.escape(r["requisites"])
+        name = html.escape(r["full_name"] or str(uid))
+        uname = f" (@{r['username']})" if r["username"] else ""
+        dt_str = datetime.fromtimestamp(r["created_at"]).strftime("%d.%m %H:%M")
+        lines.append(f"#{wid} | <b>{name}</b>{uname} (<code>{uid}</code>)\n   Сумма: <b>{amt:.2f} ₽</b> | {dt_str}\n   Реквизиты: <code>{reqs}</code>\n")
+        buttons.append([
+            InlineKeyboardButton(text=f"✅ Выплачено #{wid} ({amt:.0f} ₽)", callback_data=f"adm_w_ok:{wid}"),
+            InlineKeyboardButton(text=f"❌ Отклонить #{wid}", callback_data=f"adm_w_no:{wid}"),
+        ])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "adm_withdrawals")
+async def cb_adm_withdrawals(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    text, kb = await render_withdrawals_admin()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_w_ok:"))
+async def cb_adm_w_ok(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    wid = int(call.data.split(":", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM withdrawals WHERE id = ?", (wid,)) as cur:
+            w = await cur.fetchone()
+        if not w or w["status"] != "pending":
+            await call.answer("Заявка уже обработана", show_alert=True)
+            return
+        await db.execute("UPDATE withdrawals SET status = 'paid' WHERE id = ?", (wid,))
+        await db.commit()
+
+    await call.answer(f"✅ Заявка #{wid} отмечена как выплаченная!")
+    try:
+        await bot.send_message(
+            w["user_id"],
+            f"✅ <b>Выплата {w['amount']:.2f} ₽ успешно отправлена!</b>\n"
+            f"Реквизиты: <code>{html.escape(w['requisites'])}</code>\nСпасибо за участие в партнёрской программе!",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    text, kb = await render_withdrawals_admin()
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_w_no:"))
+async def cb_adm_w_no(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    wid = int(call.data.split(":", 1)[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM withdrawals WHERE id = ?", (wid,)) as cur:
+            w = await cur.fetchone()
+        if not w or w["status"] != "pending":
+            await call.answer("Заявка уже обработана", show_alert=True)
+            return
+        await db.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (wid,))
+        await db.execute("UPDATE users SET ref_balance = ref_balance + ? WHERE user_id = ?", (w["amount"], w["user_id"]))
+        await db.commit()
+
+    await call.answer(f"❌ Заявка #{wid} отклонена, средства возвращены на баланс")
+    try:
+        await bot.send_message(
+            w["user_id"],
+            f"⚠️ <b>Заявка на вывод {w['amount']:.2f} ₽ отклонена</b> (проверь правильность реквизитов или обратись в поддержку @{SUPPORT_USERNAME}).\n"
+            f"Средства возвращены на твой реферальный баланс.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    text, kb = await render_withdrawals_admin()
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ================= ВИДЕО (АНАЛИЗ В GEMINI / CLAUDE / GPT, 1 ВИДЕО = 1 ЗАПРОС) =================
@@ -1196,20 +1642,18 @@ async def handle_video(message: Message, bot: Bot):
     model_id = user["selected_model"]
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
     if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
-        disc = has_active_discount(user)
         await message.answer(
             "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
-            reply_markup=shop_kb(disc),
+            reply_markup=shop_main_kb(),
         )
         return
 
     quota_receipt = await try_consume_quota(user_id, pro_active, count=VIDEO_COST)
     if not quota_receipt:
-        disc = has_active_discount(user)
         await message.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
+            "Приходи завтра, пригласи друга за +2 запроса (/ref) или оформи подписку / пакет:",
+            reply_markup=shop_main_kb(),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1264,20 +1708,18 @@ async def handle_voice(message: Message, bot: Bot):
     model_id = user["selected_model"]
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
     if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
-        disc = has_active_discount(user)
         await message.answer(
             "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
-            reply_markup=shop_kb(disc),
+            reply_markup=shop_main_kb(),
         )
         return
 
     quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
     if not quota_receipt:
-        disc = has_active_discount(user)
         await message.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
+            "Приходи завтра, пригласи друга за +2 запроса (/ref) или оформи подписку / пакет:",
+            reply_markup=shop_main_kb(),
         )
         return
 
@@ -1385,20 +1827,18 @@ async def handle_document(message: Message, bot: Bot):
     model_id = user["selected_model"]
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
     if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
-        disc = has_active_discount(user)
         await message.answer(
             "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
-            reply_markup=shop_kb(disc),
+            reply_markup=shop_main_kb(),
         )
         return
 
     quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
     if not quota_receipt:
-        disc = has_active_discount(user)
         await message.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
+            "Приходи завтра, пригласи друга за +2 запроса (/ref) или оформи подписку / пакет:",
+            reply_markup=shop_main_kb(),
         )
         return
 
@@ -1575,7 +2015,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
 
     if has_active_discount(user):
         d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        disc_str = f"🔥 <b>Активна 50% (до {d_exp})</b>"
+        disc_str = f"🔥 <b>Активна {DISCOUNT_PERCENT}% (до {d_exp})</b>"
     elif user.get("discount_offered"):
         disc_str = "⏳ Истекла"
     else:
@@ -1621,15 +2061,18 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
 
     cur_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
     ref_by = f"<code>{user['referred_by']}</code>" if user.get("referred_by") else "сам пришёл"
+    ref_bal = user.get("ref_balance") or 0.0
+    ref_earned = user.get("ref_total_earned") or 0.0
 
     text = (
         f"👤 <b>Карточка пользователя</b>\n\n"
         f"📛 Имя: <b>{html.escape(user.get('full_name') or 'Пользователь')}</b>{uname_str}\n"
         f"🆔 ID: <code>{target_id}</code>\n"
         f"📅 В боте с: <b>{joined_str}</b>\n"
-        f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n\n"
+        f"🔗 Пригласил: {ref_by} | Привёл друзей: <b>{refs_count}</b>\n"
+        f"💸 Реф. баланс: <b>{ref_bal:.2f} ₽</b> (всего: {ref_earned:.2f} ₽)\n\n"
         f"💎 Подписка: {sub_str}\n"
-        f"🏷 Скидка 50%: {disc_str}\n"
+        f"🏷 Скидка {DISCOUNT_PERCENT}%: {disc_str}\n"
         f"🤖 Модель: <b>{cur_model}</b>\n"
         f"⚡ Запросы сегодня: <b>{user['used_today']}/{total_daily}</b> (осталось {left_today})\n"
         f"📦 Запросы из пакета: <b>{user.get('extra_requests', 0)} шт.</b>\n"
@@ -1881,87 +2324,6 @@ async def cb_adm_u_resetday(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-# ================= ЛИДЕРБОРД НЕДЕЛИ =================
-async def render_leaderboard_text(user_id: int) -> str:
-    wk = current_week_key()
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """
-            SELECT w.referrer_id, w.count, u.full_name
-            FROM weekly_refs w
-            LEFT JOIN users u ON u.user_id = w.referrer_id
-            WHERE w.week_key = ? AND w.count > 0
-            ORDER BY w.count DESC
-            LIMIT 10
-            """,
-            (wk,),
-        ) as cur:
-            top_rows = await cur.fetchall()
-
-        async with db.execute(
-            "SELECT count FROM weekly_refs WHERE week_key = ? AND referrer_id = ?",
-            (wk, user_id),
-        ) as cur:
-            my_row = await cur.fetchone()
-            my_count = my_row["count"] if my_row else 0
-
-    lines = [
-        f"🏆 <b>Еженедельный лидерборд ({wk})</b>\n",
-        "Приглашай друзей по своей ссылке — каждый подписавшийся на канал друг даёт <b>+1 балл</b> в рейтинг!\n",
-        "🎁 <b>Награды в конце недели:</b>",
-        "🥇 1 место — <b>Подписка на 30 дней</b>",
-        "🥈 2 место — <b>Подписка на 15 дней</b>",
-        "🥉 3 место — <b>Подписка на 7 дней</b>",
-        "🎖 4–10 места — <b>Пакет +20 запросов</b>\n",
-        "📊 <b>Текущий ТОП-10:</b>",
-    ]
-
-    if not top_rows:
-        lines.append("<i>Пока никто не пригласил друзей на этой неделе. Стань первым!</i>")
-    else:
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        for idx, r in enumerate(top_rows, start=1):
-            prefix = medals.get(idx, f"{idx}.")
-            name = html.escape(r["full_name"] or f"ID {r['referrer_id']}")
-            lines.append(f"{prefix} <b>{name}</b> — {r['count']} др.")
-
-    lines.append(f"\n👤 Твой результат за неделю: <b>{my_count} др.</b>")
-    return "\n".join(lines)
-
-
-@router.message(Command("top"))
-async def cmd_top(message: Message, bot: Bot):
-    await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
-    if not await ensure_subscribed(bot, message.from_user.id, message):
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="ref_info")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
-        ]
-    )
-    await message.answer(await render_leaderboard_text(message.from_user.id), reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data == "leaderboard")
-async def cb_leaderboard(call: CallbackQuery, bot: Bot):
-    if not await ensure_subscribed(bot, call.from_user.id, call.message):
-        await call.answer()
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Моя реферальная ссылка", callback_data="ref_info")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")],
-        ]
-    )
-    try:
-        await call.message.edit_text(await render_leaderboard_text(call.from_user.id), reply_markup=kb, parse_mode=ParseMode.HTML)
-    except TelegramBadRequest:
-        pass
-    await call.answer()
-
-
 # ================= ПРОВЕРКА ПОДПИСКИ CALLBACK =================
 @router.callback_query(F.data == "check_sub")
 async def cb_check_sub(call: CallbackQuery, bot: Bot):
@@ -1989,6 +2351,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
     total_limit = FREE_DAILY_LIMIT + user["bonus_limit"]
     left = max(0, total_limit - user["used_today"])
     extra = user.get("extra_requests", 0)
+    ref_bal = user.get("ref_balance") or 0.0
 
     if pro_active:
         if user["pro_until"] > time.time() + 365 * 5 * 86400:
@@ -2007,7 +2370,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
     disc_line = ""
     if has_active_discount(user):
         d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        disc_line = f"\n🔥 Персональная скидка 50%: <b>Активна до {d_exp}</b>"
+        disc_line = f"\n🔥 Персональная скидка {DISCOUNT_PERCENT}%: <b>Активна до {d_exp}</b>"
 
     return (
         f"👤 <b>Профиль — {html.escape(first_name)}</b>\n\n"
@@ -2015,6 +2378,7 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         f"{sub_block}\n"
         f"{req_block}\n"
         f"📦 Запросы из пакета: <b>{extra} шт.</b>\n"
+        f"💸 Партнёрский баланс: <b>{ref_bal:.2f} ₽</b>\n"
         f"🤖 Выбранная модель: <b>{cur_model_name}</b>"
         f"{disc_line}"
     )
@@ -2115,6 +2479,8 @@ async def render_admin_text() -> str:
             promos_count = (await cur.fetchone())[0]
         async with db.execute("SELECT COALESCE(SUM(stars), 0) FROM payments") as cur:
             total_stars = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'") as cur:
+            pending_w = (await cur.fetchone())[0]
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
@@ -2123,6 +2489,7 @@ async def render_admin_text() -> str:
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
         f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
+        f"💸 Заявок на вывод: <b>{pending_w} шт.</b>\n"
         f"🎟 Создано промокодов: <b>{promos_count}</b>\n"
         f"⚡ Запросов сегодня: <b>{today_reqs}</b>\n\n"
         "<i>Быстрые команды:\n"
@@ -2149,19 +2516,6 @@ async def cb_admin_panel(call: CallbackQuery):
     except TelegramBadRequest:
         pass
     await call.answer()
-
-
-@router.callback_query(F.data == "adm_finish_week")
-async def cb_adm_finish_week(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != ADMIN_ID:
-        return
-    wk = current_week_key()
-    report = await distribute_weekly_rewards(bot, wk)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM weekly_refs WHERE week_key = ?", (wk,))
-        await db.commit()
-    await call.message.answer(report, parse_mode=ParseMode.HTML)
-    await call.answer("🏆 Призы недели выданы!")
 
 
 @router.callback_query(F.data == "adm_promo_create")
@@ -2482,7 +2836,7 @@ async def cmd_start(message: Message, bot: Bot):
         f"👋 <b>Привет, {html.escape(message.from_user.first_name)}!</b>\n\n"
         f"Я — твой универсальный ИИ-помощник. Вот что я умею:\n"
         f"💬 Отвечать на любые вопросы и писать код\n"
-        f"📸 Решать задачи и разбирать конспекты по фото\n"
+        f"📸 Решать задачи и разбирать конспекты по фото (до {MAX_ALBUM_PHOTOS} шт. за раз)\n"
         f"🎬 Анализировать видеоролики, голосовые и файлы\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>"
@@ -2512,8 +2866,7 @@ async def cmd_shop(message: Message, bot: Bot):
     user = await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
-    disc = has_active_discount(user)
-    await message.answer(render_shop_text(user), reply_markup=shop_kb(disc), parse_mode=ParseMode.HTML)
+    await message.answer(render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("clear"))
@@ -2606,66 +2959,6 @@ async def cb_clear_chat(call: CallbackQuery):
     await call.answer("🧹 Память диалога очищена!", show_alert=True)
 
 
-@router.callback_query(F.data == "ref_info")
-async def cb_ref_info(call: CallbackQuery, bot: Bot):
-    try:
-        if not await ensure_subscribed(bot, call.from_user.id, call.message):
-            await call.answer()
-            return
-        me = await bot.get_me()
-        bot_username = me.username or "AetherNeural_bot"
-        base_tg = "https" + "://" + "t.me"
-        ref_link = f"{base_tg}/{bot_username}?start={call.from_user.id}"
-        share_text = quote("Бесплатный ИИ-бот без VPN: GPT-6, Claude 5 и Gemini!")
-        share_url = f"{base_tg}/share/url?url={quote(ref_link)}&text={share_text}"
-
-        buttons = [
-            [InlineKeyboardButton(text="📤 Отправить ссылку другу", url=share_url)],
-        ]
-
-        try:
-            from aiogram.types import CopyTextButton
-            buttons.append([
-                InlineKeyboardButton(
-                    text="📋 Скопировать ссылку",
-                    copy_text=CopyTextButton(text=ref_link),
-                )
-            ])
-        except Exception:
-            pass
-
-        buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_cats")])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-        await call.message.answer(
-            f"👥 <b>Бонус за друзей + Лидерборд недели</b>\n\n"
-            f"За каждого друга, который перейдет по твоей ссылке и <b>подпишется на канал</b>:\n"
-            f"• Твой дневной лимит вырастет на <b>+2 запроса</b>\n"
-            f"• Ты получишь <b>+1 балл</b> в еженедельный топ (/top) с розыгрышем подписок на 30, 15 и 7 дней!\n\n"
-            f"🔗 Твоя ссылка:\n<code>{ref_link}</code>",
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        await call.answer()
-    except Exception as e:
-        await call.answer(f"Ошибка: {str(e)[:150]}", show_alert=True)
-
-
-@router.callback_query(F.data == "shop")
-async def cb_shop(call: CallbackQuery, bot: Bot):
-    if not await ensure_subscribed(bot, call.from_user.id, call.message):
-        await call.answer()
-        return
-    user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
-    disc = has_active_discount(user)
-    try:
-        await call.message.edit_text(render_shop_text(user), reply_markup=shop_kb(disc), parse_mode=ParseMode.HTML)
-    except TelegramBadRequest:
-        pass
-    await call.answer()
-
-
 # ================= ГЕНЕРАЦИЯ (ТЕКСТ И РАЗБОР ФОТО ЧЕРЕЗ ВЫБРАННЫЙ ДВИЖОК) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
     if user_id == ADMIN_ID and selected_model:
@@ -2724,7 +3017,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
             response = await ai_client.chat.completions.create(
                 model=candidate_id,
                 messages=messages_payload,
-                max_tokens=2000,
+                max_tokens=2500,
             )
             content = response.choices[0].message.content
             if content:
@@ -2736,7 +3029,7 @@ async def generate_photos_response(user_id: int, selected_model: str, caption: s
     raise last_error or RuntimeError("Модели распознавания фото временно недоступны")
 
 
-# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (1 ФОТО = 1 ЗАПРОС) =================
+# ================= ОБРАБОТКА ОДИНОЧНЫХ ФОТО И АЛЬБОМОВ (ДО 10 ФОТО, ЖЁСТКИЙ КОНТРОЛЬ ЛИМИТА) =================
 async def process_photo_batch(messages: list[Message], bot: Bot):
     first_msg = messages[0]
     user_id = first_msg.from_user.id
@@ -2763,18 +3056,19 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
     count = len(messages)
     total_cost = count * PHOTO_COST
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
+
+    # Жёстко проверяем и списываем квоту ровно на количество фото (чтобы не выходить за лимит)
     quota_receipt = await try_consume_quota(user_id, pro_active, count=total_cost)
     if not quota_receipt:
-        disc = has_active_discount(user)
         total_limit = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
         daily_left = max(0, total_limit - (user.get("used_today") or 0))
         extra_left = user.get("extra_requests") or 0
         avail = daily_left + extra_left
         await first_msg.answer(
             f"⏳ <b>Недостаточно запросов для обработки {count} фото</b> (1 фото = 1 запрос).\n"
-            f"Сейчас доступно: <b>{avail} запр.</b>\n\n"
-            "Пригласи друга (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
+            f"Сейчас доступно: <b>{avail} запр.</b> (не хватает ещё <b>{total_cost - avail}</b>).\n\n"
+            "Отправь меньше фотографий, пригласи друга (/ref) или оформи подписку / пакет:",
+            reply_markup=shop_main_kb(),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2855,7 +3149,7 @@ async def handle_photo(message: Message, bot: Bot):
         is_first = mg_id not in MEDIA_GROUP_BUFFER
         MEDIA_GROUP_BUFFER.setdefault(mg_id, []).append(message)
         if is_first:
-            await asyncio.sleep(1.3)
+            await asyncio.sleep(1.5)
             batch = MEDIA_GROUP_BUFFER.pop(mg_id, [])
             if batch:
                 batch.sort(key=lambda m: m.message_id)
@@ -2864,13 +3158,104 @@ async def handle_photo(message: Message, bot: Bot):
         await process_photo_batch([message], bot)
 
 
-# ================= ОБРАБОТКА ТЕКСТА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
+# ================= ОБРАБОТКА ТЕКСТА, КАСТОМНЫХ ПОКУПОК, ВЫВОДА, ПРОМОКОДОВ И АДМИН-ВВОДА =================
 @router.message(F.text)
 async def handle_prompt(message: Message, bot: Bot):
     user_id = message.from_user.id
     text_in = message.text.strip()
+    state = USER_INPUT_STATE.get(user_id, "")
 
-    if USER_INPUT_STATE.get(user_id) == "promo_activate":
+    # 1. Ввод своего количества дней подписки (1–60)
+    if state == "await_custom_sub_days":
+        if not text_in.isdigit() or not (1 <= int(text_in) <= MAX_CUSTOM_SUB_DAYS):
+            await message.answer(
+                f"⚠️ Введи целое число от <b>1 до {MAX_CUSTOM_SUB_DAYS}</b> дней:",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="shop:subs")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        USER_INPUT_STATE.pop(user_id, None)
+        days = int(text_in)
+        await send_payment_method_choice(message, user_id, f"csub:{days}", edit=False)
+        return
+
+    # 2. Ввод своего количества запросов в пакет (10–500)
+    if state == "await_custom_pack_reqs":
+        if not text_in.isdigit() or not (MIN_CUSTOM_PACK_REQS <= int(text_in) <= MAX_CUSTOM_PACK_REQS):
+            await message.answer(
+                f"⚠️ Введи целое число от <b>{MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS}</b> запросов:",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="shop:packs")]]
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        USER_INPUT_STATE.pop(user_id, None)
+        reqs = int(text_in)
+        await send_payment_method_choice(message, user_id, f"cpack:{reqs}", edit=False)
+        return
+
+    # 3. Ввод реквизитов для вывода партнёрских средств (от 100 ₽)
+    if state == "await_withdraw_reqs":
+        if len(text_in) < 5:
+            await message.answer(
+                "⚠️ Укажи корректные реквизиты (номер телефона СБП / карты и банк):",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="ref_info")]]
+                ),
+            )
+            return
+        USER_INPUT_STATE.pop(user_id, None)
+        lock = get_user_lock(user_id)
+        async with lock:
+            user_w = await get_user(user_id)
+            bal = user_w.get("ref_balance") or 0.0
+            if bal < MIN_WITHDRAW_RUB:
+                await message.answer(f"❌ Недостаточно средств для вывода (минимум {int(MIN_WITHDRAW_RUB)} ₽).")
+                return
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET ref_balance = 0 WHERE user_id = ?", (user_id,))
+                cur = await db.execute(
+                    "INSERT INTO withdrawals (user_id, amount, requisites, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                    (user_id, bal, text_in[:150], time.time()),
+                )
+                wid = cur.lastrowid
+                await db.commit()
+
+        await message.answer(
+            f"✅ <b>Заявка #{wid} на вывод {bal:.2f} ₽ создана!</b>\n\n"
+            f"Реквизиты: <code>{html.escape(text_in[:150])}</code>\n"
+            f"Администратор проверит заявку и переведёт средства в ближайшее время.",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            uname = f" (@{message.from_user.username})" if message.from_user.username else ""
+            adm_kb_w = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text=f"✅ Выплачено #{wid}", callback_data=f"adm_w_ok:{wid}"),
+                        InlineKeyboardButton(text=f"❌ Отклонить #{wid}", callback_data=f"adm_w_no:{wid}"),
+                    ]
+                ]
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                f"💸 <b>Новая заявка на вывод #{wid}!</b>\n\n"
+                f"👤 Пользователь: <b>{html.escape(message.from_user.full_name)}</b>{uname} (<code>{user_id}</code>)\n"
+                f"💰 Сумма: <b>{bal:.2f} ₽</b>\n"
+                f"🏦 Реквизиты: <code>{html.escape(text_in[:150])}</code>",
+                reply_markup=adm_kb_w,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # 4. Активация промокода
+    if state == "promo_activate":
         USER_INPUT_STATE.pop(user_id, None)
         if not await ensure_subscribed(bot, user_id, message):
             return
@@ -2878,6 +3263,7 @@ async def handle_prompt(message: Message, bot: Bot):
         await message.answer(reply_text, reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
         return
 
+    # 5. Админ-вводы
     if user_id == ADMIN_ID and ADMIN_ID in USER_INPUT_STATE:
         action = USER_INPUT_STATE.pop(ADMIN_ID)
 
@@ -3036,20 +3422,18 @@ async def handle_prompt(message: Message, bot: Bot):
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
 
     if ALL_MODELS_MAP.get(model_id, {}).get("pro") and not pro_active:
-        disc = has_active_discount(user)
         await message.answer(
             "🔒 Срок подписки истек. Выбери бесплатную модель в /menu или продли тариф:",
-            reply_markup=shop_kb(disc),
+            reply_markup=shop_main_kb(),
         )
         return
 
     quota_receipt = await try_consume_quota(user_id, pro_active, count=1)
     if not quota_receipt:
-        disc = has_active_discount(user)
         await message.answer(
             "⏳ Бесплатный лимит на сегодня и пакет запросов исчерпаны.\n"
-            "Приходи завтра, пригласи друга за +2 запроса (/top) или оформи подписку / пакет:",
-            reply_markup=shop_kb(disc),
+            "Приходи завтра, пригласи друга за +2 запроса (/ref) или оформи подписку / пакет:",
+            reply_markup=shop_main_kb(),
         )
         return
 
@@ -3088,7 +3472,7 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="menu", description="Выбрать нейросеть"),
         BotCommand(command="profile", description="Мой профиль, подписка и промокод"),
         BotCommand(command="shop", description="Купить подписку или пакет запросов"),
-        BotCommand(command="top", description="Еженедельный лидерборд и призы"),
+        BotCommand(command="ref", description="Партнёрка 25% и вывод средств"),
         BotCommand(command="docs", description="Документы, оферта и поддержка"),
         BotCommand(command="clear", description="Очистить память диалога"),
     ]
@@ -3099,7 +3483,6 @@ async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
-    asyncio.create_task(weekly_leaderboard_watcher(bot))
     asyncio.create_task(delayed_discount_watcher(bot))
     dp = Dispatcher()
     dp.include_router(router)
