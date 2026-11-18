@@ -1936,45 +1936,151 @@ async def cb_adm_w_no(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-# ================= ВИДЕО (АНАЛИЗ В GEMINI / CLAUDE / GPT, 1 ВИДЕО = 1 ЗАПРОС) =================
-async def generate_video_response(
-    user_id: int, selected_model: str, caption: str, b64_video: str, mime_type: str
-) -> str:
-    # Видео и аудио в OpenAI-совместимых шлюзах корректно принимают только модели Gemini;
-    # если у админа выбрана Gemini — ставим её первой, иначе сразу идём по Gemini-моделям.
-    if user_id == ADMIN_ID and selected_model and "gemini" in selected_model.lower():
-        candidates = [selected_model] + [m for m in VIDEO_FALLBACK_MODELS if m != selected_model and "gemini" in m]
-    else:
-        candidates = [m for m in VIDEO_FALLBACK_MODELS if "gemini" in m]
+# ================= ВИДЕО, КРУЖОЧКИ И АУДИО (УНИВЕРСАЛЬНЫЙ ШЛЮЗ + РАСКАДРОВКА) =================
+async def extract_video_frames_b64(raw_bytes: bytes, max_frames: int = 5) -> list[str]:
+    """Извлекает ключевые кадры (JPEG base64) из видео/кружочка через ffmpeg или cv2,
+    чтобы любую видеозапись можно было разобрать через обычные Vision-модели (GPT-6 / Claude / Gemini)."""
+    import subprocess
+    import tempfile
 
-    user_content = [
+    def _run_extract() -> list[str]:
+        frames: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_path = os.path.join(tmpdir, "input.mp4")
+            with open(in_path, "wb") as f:
+                f.write(raw_bytes)
+
+            # 1. Пробуем системный ffmpeg (или imageio_ffmpeg)
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if not ffmpeg_bin:
+                try:
+                    import imageio_ffmpeg
+                    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                except Exception:
+                    ffmpeg_bin = None
+
+            if ffmpeg_bin:
+                out_pattern = os.path.join(tmpdir, "frame_%02d.jpg")
+                cmd = [
+                    ffmpeg_bin, "-y", "-i", in_path,
+                    "-vf", "fps=1,scale='min(720,iw)':-1",
+                    "-frames:v", str(max_frames),
+                    "-q:v", "4",
+                    out_pattern,
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                for fn in sorted(os.listdir(tmpdir)):
+                    if fn.startswith("frame_") and fn.endswith(".jpg"):
+                        with open(os.path.join(tmpdir, fn), "rb") as img_f:
+                            frames.append(base64.b64encode(img_f.read()).decode("utf-8"))
+                if frames:
+                    return frames
+
+            # 2. Резерв через OpenCV (cv2), если установлен на хостинге
+            try:
+                import cv2
+                cap = cv2.VideoCapture(in_path)
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+                if total > 0:
+                    step = max(1, total // max_frames)
+                    for idx in range(0, total, step):
+                        if len(frames) >= max_frames:
+                            break
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ok, frame = cap.read()
+                        if ok and frame is not None:
+                            ok_jpg, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                            if ok_jpg:
+                                frames.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
+                cap.release()
+            except Exception:
+                pass
+        return frames
+
+    return await asyncio.to_thread(_run_extract)
+
+
+async def generate_media_multimodal_response(
+    user_id: int, selected_model: str, caption: str, b64_data: str, mime_type: str
+) -> str:
+    """Пробует отправить медиафайл через input_audio / image_url / file по всем доступным моделям."""
+    candidates = await get_candidates_for_user(user_id, selected_model)
+    for m in VIDEO_FALLBACK_MODELS:
+        if m not in candidates:
+            candidates.append(m)
+
+    is_audio = mime_type.startswith("audio/")
+    fmt = "ogg" if "ogg" in mime_type else ("wav" if "wav" in mime_type else "mp3")
+
+    payload_variants = []
+    if is_audio:
+        payload_variants.append([
+            {"type": "text", "text": caption},
+            {"type": "input_audio", "input_audio": {"data": b64_data, "format": fmt}},
+        ])
+    payload_variants.append([
         {"type": "text", "text": caption},
-        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_video}"}},
-    ]
-    messages_payload = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}},
+    ])
 
     last_error = None
-    for candidate_id in candidates:
-        try:
-            response = await asyncio.wait_for(
-                ai_client.chat.completions.create(
-                    model=candidate_id,
-                    messages=messages_payload,
-                    max_tokens=1500,
-                ),
-                timeout=30.0,
-            )
-            content = response.choices[0].message.content
-            if content:
-                return content
-        except Exception as e:
-            last_error = e
-            continue
+    for user_content in payload_variants:
+        messages_payload = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+        for candidate_id in candidates:
+            try:
+                response = await asyncio.wait_for(
+                    ai_client.chat.completions.create(
+                        model=candidate_id,
+                        messages=messages_payload,
+                        max_tokens=1500,
+                    ),
+                    timeout=25.0,
+                )
+                content = response.choices[0].message.content
+                if content:
+                    return content
+            except Exception as e:
+                last_error = e
+                err_s = str(e)
+                # Если модель не поддерживает этот формат (400/404/422), быстро переходим дальше
+                if any(code in err_s for code in ("404", "400", "422", "unsupported", "not found")):
+                    continue
+                continue
 
-    raise last_error or RuntimeError("Модели обработки видео/аудио временно недоступны")
+    raise last_error or RuntimeError("Модели обработки медиа временно недоступны")
+
+
+async def transcribe_audio_whisper(raw_bytes: bytes, filename: str = "voice.ogg") -> str:
+    """Пробует расшифровать речь через эндпоинт /audio/transcriptions с разными моделями."""
+    whisper_candidates = []
+    for wm in (WHISPER_MODEL, "whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"):
+        if wm and wm not in whisper_candidates:
+            whisper_candidates.append(wm)
+
+    last_err = None
+    for wm in whisper_candidates:
+        try:
+            audio_bio = io.BytesIO(raw_bytes)
+            audio_bio.name = filename
+            transcript = await asyncio.wait_for(
+                ai_client.audio.transcriptions.create(
+                    model=wm,
+                    file=audio_bio,
+                ),
+                timeout=18.0,
+            )
+            txt = (getattr(transcript, "text", None) or "").strip()
+            if txt:
+                return txt
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return ""
 
 
 @router.message(F.video | F.video_note)
@@ -2026,48 +2132,65 @@ async def handle_video(message: Message, bot: Bot):
 
         if is_circle:
             caption = (
-                "Это видеосообщение (кружочек) из Telegram. Внимательно разбери, что говорит и показывает пользователь "
+                "Это видеосообщение (кружочек) из Telegram. Внимательно разбери, что происходит и что говорит человек "
                 "в кружочке, и дай понятный, полезный ответ по существу."
             )
         else:
             caption = (message.caption or "").strip() or "Подробно разбери, что происходит на этом видео, и ответь на задание или вопрос."
 
         answer_text = None
+
+        # Попытка 1: прямая отправка видеофайла в мультимодальный шлюз
         try:
-            answer_text = await generate_video_response(
+            answer_text = await generate_media_multimodal_response(
                 user_id=user_id,
                 selected_model=model_id,
                 caption=caption,
-                b64_video=b64_video,
+                b64_data=b64_video,
                 mime_type=mime_type,
             )
         except Exception:
-            if is_circle:
-                audio_bio = io.BytesIO(raw_bytes)
-                audio_bio.name = "circle.mp4"
-                transcript = await asyncio.wait_for(
-                    ai_client.audio.transcriptions.create(
-                        model=WHISPER_MODEL,
-                        file=audio_bio,
-                    ),
-                    timeout=20.0,
+            answer_text = None
+
+        # Попытка 2: извлекаем кадры + расшифровываем речь из видео и отправляем через обычный Vision (работает 100% как фото!)
+        if not answer_text:
+            speech_text = ""
+            try:
+                speech_text = await transcribe_audio_whisper(raw_bytes, filename="video.mp4")
+            except Exception:
+                speech_text = ""
+
+            if speech_text and is_content_forbidden(speech_text):
+                await refund_quota(user_id, quota_receipt)
+                await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+                return
+
+            frames_b64 = await extract_video_frames_b64(raw_bytes, max_frames=5)
+            if frames_b64:
+                frame_prompt = caption
+                if speech_text:
+                    frame_prompt += f"\n\nРасшифровка речи из видео: «{speech_text}»"
+                else:
+                    frame_prompt += f"\n(Это {len(frames_b64)} последовательных кадров из {media_label}а)."
+                answer_text = await generate_photos_response(
+                    user_id=user_id,
+                    selected_model=model_id,
+                    caption=frame_prompt,
+                    b64_images=frames_b64,
                 )
-                recognized_speech = (getattr(transcript, "text", None) or "").strip()
-                if not recognized_speech:
-                    raise
-                if is_content_forbidden(recognized_speech):
-                    await refund_quota(user_id, quota_receipt)
-                    await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
-                    return
+            elif speech_text:
                 history = await get_history(user_id)
                 answer_text = await generate_text_response(
                     user_id=user_id,
                     selected_model=model_id,
                     history=history,
-                    user_text=recognized_speech,
+                    user_text=f"{caption}\n\nРечь из {media_label}а: {speech_text}",
                 )
             else:
-                raise
+                raise RuntimeError(
+                    "Текущий API-шлюз не поддерживает прямую загрузку видео (404), "
+                    "а на сервере не установлен ffmpeg для нарезки кадров."
+                )
 
         hist_label = "[Отправил кружочек]" if is_circle else f"[Отправил видео с подписью: {caption}]"
         await add_history(user_id, "user", hist_label)
@@ -2086,12 +2209,12 @@ async def handle_video(message: Message, bot: Bot):
     except Exception as e:
         await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
-            f"⚠️ <b>Не удалось обработать {media_label}:</b>\n<code>{str(e)[:250]}</code>",
+            f"⚠️ <b>Не удалось обработать {media_label}:</b>\n<code>{html.escape(str(e)[:280])}</code>",
             parse_mode=ParseMode.HTML,
         )
 
 
-# ================= ГОЛОСОВЫЕ И АУДИО СООБЩЕНИЯ (VOICE / AUDIO -> WHISPER / LLM) =================
+# ================= ГОЛОСОВЫЕ И АУДИО СООБЩЕНИЯ (VOICE / AUDIO -> WHISPER / MULTIMODAL) =================
 @router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
     user_id = message.from_user.id
@@ -2138,16 +2261,7 @@ async def handle_voice(message: Message, bot: Bot):
 
         recognized_text = ""
         try:
-            audio_bio = io.BytesIO(raw_audio)
-            audio_bio.name = f"voice{ext_from_tg}"
-            transcript = await asyncio.wait_for(
-                ai_client.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=audio_bio,
-                ),
-                timeout=20.0,
-            )
-            recognized_text = (getattr(transcript, "text", None) or "").strip()
+            recognized_text = await transcribe_audio_whisper(raw_audio, filename=f"voice{ext_from_tg}")
         except Exception:
             recognized_text = ""
 
@@ -2178,15 +2292,15 @@ async def handle_voice(message: Message, bot: Bot):
             full_reply = f"🗣 Вы сказали: {recognized_text}\n\n{answer_text}"
             await send_formatted_answer(message, full_reply)
         else:
-            # Резерв: если Whisper недоступен на шлюзе, отправляем аудио напрямую в мультимодальную модель (Gemini)
+            # Резерв: если Whisper вернул 503/404, отправляем аудио через input_audio / base64 во все доступные модели
             mime_audio = getattr(voice_obj, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
             b64_audio = base64.b64encode(raw_audio).decode("utf-8")
             audio_prompt = extra_caption or "Внимательно прослушай это голосовое сообщение, кратко передай суть сказанного и дай подробный ответ."
-            answer_text = await generate_video_response(
+            answer_text = await generate_media_multimodal_response(
                 user_id=user_id,
                 selected_model=model_id,
                 caption=audio_prompt,
-                b64_video=b64_audio,
+                b64_data=b64_audio,
                 mime_type=mime_audio,
             )
             await add_history(user_id, "user", f"[Голосовое сообщение]{': ' + extra_caption if extra_caption else ''}")
@@ -2201,8 +2315,16 @@ async def handle_voice(message: Message, bot: Bot):
 
     except Exception as e:
         await refund_quota(user_id, quota_receipt)
+        err_msg = str(e)
+        if "503" in err_msg or "No available accounts" in err_msg or "404" in err_msg:
+            human_err = (
+                "На сервере API сейчас нет свободных аккаунтов для распознавания аудио/видео "
+                f"(<code>{html.escape(err_msg[:140])}</code>). Попробуй чуть позже или напиши текстом / скинь фото."
+            )
+        else:
+            human_err = f"<code>{html.escape(err_msg[:250])}</code>"
         await wait_msg.edit_text(
-            f"⚠️ <b>Не удалось обработать голосовое:</b>\n<code>{str(e)[:250]}</code>",
+            f"⚠️ <b>Не удалось обработать голосовое:</b>\n{human_err}",
             parse_mode=ParseMode.HTML,
         )
 
