@@ -184,9 +184,9 @@ for cat_data in CATEGORIES.values():
             ALL_MODELS_MAP[m["id"]] = m
 
 PRODUCTS = {
-    "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 59, "rub": 79, "value": 1},
-    "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 149, "rub": 199, "value": 7},
-    "sub_premium": {"type": "sub", "title": "Премиум 30 дней", "stars": 349, "rub": 449, "value": 30},
+    "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 29, "rub": 39, "value": 1},
+    "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 115, "rub": 149, "value": 7},
+    "sub_premium": {"type": "sub", "title": "Премиум 30 дней", "stars": 269, "rub": 349, "value": 30},
     "pack_30": {"type": "pack", "title": "Пакет +30 запросов", "stars": 79, "rub": 99, "value": 30},
     "pack_100": {"type": "pack", "title": "Пакет +100 запросов", "stars": 199, "rub": 259, "value": 100},
     "pack_300": {"type": "pack", "title": "Пакет +300 запросов", "stars": 449, "rub": 589, "value": 300},
@@ -304,20 +304,20 @@ def calc_custom_sub_price(days: int, discount_percent: int | bool) -> tuple[int,
     """Возвращает (rub_price, stars_price) для кастомного срока подписки от 1 до 60 дней."""
     pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
     if days == 1:
-        base_rub, base_stars = 79, 59
+        base_rub, base_stars = 39, 29
     elif days == 7:
-        base_rub, base_stars = 199, 149
+        base_rub, base_stars = 149, 115
     elif days == 30:
-        base_rub, base_stars = 449, 349
+        base_rub, base_stars = 349, 269
     elif days < 7:
-        base_rub = days * 65
-        base_stars = days * 50
+        base_rub = days * 32
+        base_stars = days * 25
     elif days < 30:
-        base_rub = days * 25
-        base_stars = days * 19
+        base_rub = days * 18
+        base_stars = days * 14
     else:
-        base_rub = days * 15
-        base_stars = days * 12
+        base_rub = days * 12
+        base_stars = days * 9
 
     return apply_discount_rub(base_rub, pct), apply_discount_stars(base_stars, pct)
 
@@ -1054,9 +1054,9 @@ async def delayed_discount_watcher(bot: Bot):
                         f"🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА {DISCOUNT_PERCENT}% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
                         f"Мы снизили цены на <b>{DISCOUNT_PERCENT}%</b> на все подписки и пакеты запросов (от 5 ₽) специально для тебя на ближайшие <b>36 часов</b>:\n\n"
                         "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
-                        f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], True)} ⭐)\n"
-                        f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], True)} ⭐)\n"
-                        f"• Премиум 30 дней: <s>449 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], True)} ⭐)\n\n"
+                        f"• Пробный 1 день: <s>{PRODUCTS['sub_trial']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], True)} ⭐)\n"
+                        f"• Стандарт 7 дней: <s>{PRODUCTS['sub_standard']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], True)} ⭐)\n"
+                        f"• Премиум 30 дней: <s>{PRODUCTS['sub_premium']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], True)} ⭐)\n\n"
                         "⚡ <b>Пакеты запросов (не сгорают):</b>\n"
                         f"• +30 запросов: <s>99 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_30'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_30'], True)} ⭐)\n"
                         f"• +100 запросов: <s>259 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_100'], True)} ₽</b> ({get_product_price(PRODUCTS['pack_100'], True)} ⭐)\n"
@@ -3109,9 +3109,9 @@ async def cb_adm_gdisc_notify(call: CallbackQuery, bot: Bot):
         f"🔥 <b>ГЛОБАЛЬНАЯ СКИДКА {pct}% ДЛЯ ВСЕХ УЖЕ ДЕЙСТВУЕТ!</b>\n\n"
         f"Снизили цены на <b>{pct}%</b> на все подписки и пакеты запросов (от 5 ₽) на <b>{rem_str}</b> (до <b>{exp_str}</b>):\n\n"
         "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
-        f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], pct)} ⭐)\n"
-        f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], pct)} ⭐)\n"
-        f"• Премиум 30 дней: <s>449 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], pct)} ⭐)\n\n"
+        f"• Пробный 1 день: <s>{PRODUCTS['sub_trial']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], pct)} ⭐)\n"
+        f"• Стандарт 7 дней: <s>{PRODUCTS['sub_standard']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], pct)} ⭐)\n"
+        f"• Премиум 30 дней: <s>{PRODUCTS['sub_premium']['rub']} ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], pct)} ⭐)\n\n"
         "⚡ <b>Пакеты запросов (не сгорают):</b>\n"
         f"• +30 запросов: <s>99 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_30'], pct)} ₽</b> ({get_product_price(PRODUCTS['pack_30'], pct)} ⭐)\n"
         f"• +100 запросов: <s>259 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_100'], pct)} ₽</b> ({get_product_price(PRODUCTS['pack_100'], pct)} ⭐)\n"
