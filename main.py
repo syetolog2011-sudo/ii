@@ -10,6 +10,7 @@ import string
 import time
 from datetime import date, datetime
 from urllib.parse import quote
+import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
@@ -32,6 +33,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 UNLOCK_API_KEY = os.getenv("UNLOCK_API_KEY", "").strip()
 UNLOCK_BASE_URL = os.getenv("UNLOCK_BASE_URL", "https" + "://" + "unlockapi.space/v1").strip()
 
+# Ключи Platega API (из личного кабинета app.platega.io)
+PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
+PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
+PLATEGA_BASE_URL = os.getenv("PLATEGA_BASE_URL", "https://app.platega.io").rstrip("/").strip()
+PLATEGA_SBP_METHOD = int(os.getenv("PLATEGA_SBP_METHOD", "2"))  # 2 = СБП QR в Platega
+
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN! Добавь её в настройках хостинга.")
 if not UNLOCK_API_KEY:
@@ -41,20 +48,20 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1991878700"))
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AetherNeural")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
+BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "https://t.me/AetherNeural_bot").strip()
 
-# Документы и поддержка для модерации Platega / банка
+# Документы и поддержка
 TERMS_URL = os.getenv("TERMS_URL", "https://telegra.ph/Polzovatelskoe-soglashenie-Oferta-11-15").strip()
 PRIVACY_URL = os.getenv("PRIVACY_URL", "https://telegra.ph/Politika-konfidencialnosti-11-15-68").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "AetherNeuralhelp").lstrip("@").strip()
 SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME}"
-MAX_RUB_TRANSACTION = 10000
 
 DB_PATH = os.getenv("DB_PATH", "data/users.sqlite3")
 
 FREE_DAILY_LIMIT = 5
 PHOTO_COST = 1          # Разбор 1 фото = 1 запрос
 VIDEO_COST = 1          # Разбор 1 видео = 1 запрос
-MAX_ALBUM_PHOTOS = 10   # Максимум 10 фото в одном альбоме (жёстко проверяется лимит запросов)
+MAX_ALBUM_PHOTOS = 10   # Максимум 10 фото в одном альбоме
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_ENGINE_MODEL = "gpt-6-luna"
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1").strip()
@@ -69,10 +76,11 @@ MIN_WITHDRAW_RUB = 100.0               # Минимальная сумма вы�
 STARS_TO_RUB_RATE = 1.3                # Курс 1 ⭐ = 1.3 ₽ для расчёта партнёрки
 
 MAX_CUSTOM_SUB_DAYS = 60               # Максимум 60 дней при кастомной покупке подписки
-MIN_CUSTOM_PACK_REQS = 10              # Минимум 10 запросов при кастомной покупке пакета
+MIN_CUSTOM_PACK_REQS = 1               # Минимум 1 запрос (3 ₽ — минималка Platega)
 MAX_CUSTOM_PACK_REQS = 500             # Максимум 500 запросов при кастомной покупке пакета
+MIN_RUB_AMOUNT = 3                     # Минимальная сумма платежа в Platega (3 ₽)
 
-# Фильтр запрещённого контента (требование банка при согласовании ИИ-проектов)
+# Фильтр запрещённого контента
 FORBIDDEN_PATTERNS = [
     r"(?:детск\w*|несовершеннолетн\w*|малолетн\w*|лоли|школот\w*|ребен\w*|девочк\w*|мальчик\w*)\s*(?:порн\w*|секс\w*|интим\w*|голы\w*|обнажен\w*|эротик\w*)",
     r"(?:порн\w*|секс\w*|интим\w*|голы\w*|обнажен\w*)\s*(?:с\s+)?(?:дет\w*|несовершеннолетн\w*|малолетн\w*|подростк\w*)",
@@ -175,7 +183,6 @@ for cat_data in CATEGORIES.values():
         if m["id"] not in ALL_MODELS_MAP:
             ALL_MODELS_MAP[m["id"]] = m
 
-# Старые готовые цены (1 ⭐ ≈ 1.3 ₽ с округлением, всё строго до 10 000 ₽)
 PRODUCTS = {
     "sub_trial": {"type": "sub", "title": "Пробный 1 день", "stars": 59, "rub": 79, "value": 1},
     "sub_standard": {"type": "sub", "title": "Стандарт 7 дней", "stars": 149, "rub": 199, "value": 7},
@@ -206,6 +213,7 @@ PROMO_DRAFT: dict[str, any] = {}
 BROADCAST_DRAFT: dict[str, int] = {}
 MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
 USER_QUOTA_LOCKS: dict[int, asyncio.Lock] = {}
+TX_FULFILL_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
@@ -214,23 +222,40 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     return USER_QUOTA_LOCKS[user_id]
 
 
+def get_tx_lock(tx_id: str) -> asyncio.Lock:
+    if tx_id not in TX_FULFILL_LOCKS:
+        TX_FULFILL_LOCKS[tx_id] = asyncio.Lock()
+    return TX_FULFILL_LOCKS[tx_id]
+
+
 # ================= РАСЧЁТ ЦЕН (ГОТОВЫХ И КАСТОМНЫХ) СО СКИДКОЙ 30% =================
 def has_active_discount(user: dict) -> bool:
     return (user.get("discount_until") or 0) > time.time()
 
 
-def apply_discount(base_val: int, discount_active: bool, min_val: int = 1) -> int:
+def apply_discount_rub(base_rub: int, discount_active: bool) -> int:
+    # На суммы меньше 5 ₽ скидка не распространяется; минималка для рублёвых платежей — 3 ₽
+    if base_rub < 5:
+        return max(MIN_RUB_AMOUNT, base_rub)
     if discount_active:
-        return max(min_val, round(base_val * (100 - DISCOUNT_PERCENT) / 100))
-    return base_val
+        return max(MIN_RUB_AMOUNT, round(base_rub * (100 - DISCOUNT_PERCENT) / 100))
+    return max(MIN_RUB_AMOUNT, base_rub)
+
+
+def apply_discount_stars(base_stars: int, discount_active: bool) -> int:
+    if base_stars < 5:
+        return max(1, base_stars)
+    if discount_active:
+        return max(1, round(base_stars * (100 - DISCOUNT_PERCENT) / 100))
+    return max(1, base_stars)
 
 
 def get_product_price(product: dict, discount_active: bool) -> int:
-    return apply_discount(product["stars"], discount_active, min_val=1)
+    return apply_discount_stars(product["stars"], discount_active)
 
 
 def get_product_rub_price(product: dict, discount_active: bool) -> int:
-    return apply_discount(product["rub"], discount_active, min_val=10)
+    return apply_discount_rub(product["rub"], discount_active)
 
 
 def calc_custom_sub_price(days: int, discount_active: bool) -> tuple[int, int]:
@@ -251,20 +276,22 @@ def calc_custom_sub_price(days: int, discount_active: bool) -> tuple[int, int]:
         base_rub = days * 15
         base_stars = days * 12
 
-    return apply_discount(base_rub, discount_active, 10), apply_discount(base_stars, discount_active, 1)
+    return apply_discount_rub(base_rub, discount_active), apply_discount_stars(base_stars, discount_active)
 
 
 def calc_custom_pack_price(reqs: int, discount_active: bool) -> tuple[int, int]:
-    """Возвращает (rub_price, stars_price) для кастомного пакета от 10 до 500 запросов."""
-    if reqs == 30:
+    """Возвращает (rub_price, stars_price) для кастомного пакета от 1 до 500 запросов (1 запрос = 3 ₽ без скидки)."""
+    if reqs == 1:
+        base_rub, base_stars = 3, 3
+    elif reqs == 30:
         base_rub, base_stars = 99, 79
     elif reqs == 100:
         base_rub, base_stars = 259, 199
     elif reqs == 300:
         base_rub, base_stars = 589, 449
     elif reqs < 100:
-        base_rub = round(reqs * 3.3)
-        base_stars = round(reqs * 2.6)
+        base_rub = max(MIN_RUB_AMOUNT, round(reqs * 3.3))
+        base_stars = max(2, round(reqs * 2.6))
     elif reqs < 300:
         base_rub = round(reqs * 2.5)
         base_stars = round(reqs * 2.0)
@@ -272,16 +299,10 @@ def calc_custom_pack_price(reqs: int, discount_active: bool) -> tuple[int, int]:
         base_rub = round(reqs * 1.9)
         base_stars = round(reqs * 1.5)
 
-    return apply_discount(base_rub, discount_active, 10), apply_discount(base_stars, discount_active, 1)
+    return apply_discount_rub(base_rub, discount_active), apply_discount_stars(base_stars, discount_active)
 
 
 def resolve_order_details(order_code: str, discount_active: bool) -> dict | None:
-    """
-    Универсальный парсер заказа:
-    - 'prod:sub_trial' / 'prod:pack_30' (готовые товары)
-    - 'csub:14' (своё кол-во дней подписки)
-    - 'cpack:50' (своё кол-во запросов)
-    """
     if order_code.startswith("prod:"):
         prod_key = order_code.split(":", 1)[1]
         p = PRODUCTS.get(prod_key)
@@ -324,7 +345,7 @@ def resolve_order_details(order_code: str, discount_active: bool) -> dict | None
         return {
             "order_code": order_code,
             "type": "pack",
-            "title": f"Пакет +{reqs} запросов",
+            "title": f"Пакет +{reqs} запр.",
             "value": reqs,
             "rub": rub_p,
             "stars": stars_p,
@@ -452,9 +473,33 @@ async def init_db():
                 product_key TEXT,
                 title TEXT,
                 stars INTEGER,
+                rub_amount REAL DEFAULT 0,
+                method TEXT DEFAULT 'stars',
                 paid_at REAL
             )
         """)
+        for col_name, col_def in [("rub_amount", "REAL DEFAULT 0"), ("method", "TEXT DEFAULT 'stars'")]:
+            try:
+                await db.execute(f"ALTER TABLE payments ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS platega_transactions (
+                transaction_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                order_code TEXT,
+                title TEXT,
+                item_type TEXT,
+                item_value INTEGER,
+                rub_amount REAL,
+                redirect_url TEXT,
+                status TEXT DEFAULT 'PENDING',
+                created_at REAL,
+                confirmed_at REAL DEFAULT 0
+            )
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -718,7 +763,6 @@ async def reward_referrer_if_needed(user_id: int, bot: Bot):
 
 
 async def credit_referral_commission(buyer_id: int, purchase_rub_amount: float, item_title: str, bot: Bot):
-    """Начисляет 25% в рублях пригласившему пользователю с любой покупки."""
     if purchase_rub_amount <= 0:
         return
     async with aiosqlite.connect(DB_PATH) as db:
@@ -760,6 +804,176 @@ async def credit_referral_commission(buyer_id: int, purchase_rub_amount: float, 
             pass
 
 
+# ================= PLATEGA API (СОЗДАНИЕ ПЛАТЕЖА И АВТОПРОВЕРКА СТАТУСА) =================
+async def platega_create_transaction(amount_rub: int, description: str, payload_str: str) -> dict:
+    if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
+        raise RuntimeError("Не заданы PLATEGA_MERCHANT_ID или PLATEGA_SECRET в настройках сервера")
+
+    url = f"{PLATEGA_BASE_URL}/transaction/process"
+    headers = {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "paymentMethod": PLATEGA_SBP_METHOD,
+        "paymentDetails": {
+            "amount": float(amount_rub),
+            "currency": "RUB",
+        },
+        "description": description[:120],
+        "return": BOT_PUBLIC_URL,
+        "failedUrl": BOT_PUBLIC_URL,
+        "payload": payload_str[:120],
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=body, headers=headers, timeout=25) as resp:
+            raw_text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Platega HTTP {resp.status}: {raw_text[:200]}")
+            data = await resp.json(content_type=None)
+
+    tx_id = str(data.get("transactionId") or data.get("id") or "").strip()
+    redirect_url = str(data.get("redirect") or data.get("url") or data.get("paymentUrl") or "").strip()
+    if not tx_id or not redirect_url:
+        raise RuntimeError(f"Некорректный ответ Platega: {raw_text[:200]}")
+
+    return {"transaction_id": tx_id, "redirect": redirect_url}
+
+
+async def platega_fetch_status(transaction_id: str) -> str:
+    if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
+        return "ERROR"
+
+    url = f"{PLATEGA_BASE_URL}/transaction/{transaction_id}"
+    headers = {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=20) as resp:
+            if resp.status >= 400:
+                return "ERROR"
+            data = await resp.json(content_type=None)
+            return str(data.get("status") or "").upper().strip()
+
+
+async def fulfill_platega_transaction(tx_id: str, bot: Bot) -> bool:
+    """Атомарно выдаёт товар при подтверждении оплаты Platega (защита от повторного начисления)."""
+    lock = get_tx_lock(tx_id)
+    async with lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM platega_transactions WHERE transaction_id = ?", (tx_id,)) as cur:
+                tx = await cur.fetchone()
+
+            if not tx or tx["status"] == "CONFIRMED":
+                return False
+
+            user_id = tx["user_id"]
+            item_type = tx["item_type"]
+            item_value = tx["item_value"]
+            title = tx["title"]
+            rub_amount = float(tx["rub_amount"] or 0)
+            order_code = tx["order_code"]
+
+            await db.execute(
+                "UPDATE platega_transactions SET status = 'CONFIRMED', confirmed_at = ? WHERE transaction_id = ?",
+                (time.time(), tx_id),
+            )
+            await db.execute(
+                "INSERT INTO payments (user_id, product_key, title, stars, rub_amount, method, paid_at) VALUES (?, ?, ?, 0, ?, 'sbp', ?)",
+                (user_id, order_code, title, rub_amount, time.time()),
+            )
+
+            user = await get_user(user_id)
+            if item_type == "sub":
+                base_time = max(time.time(), user["pro_until"])
+                new_pro_until = base_time + item_value * 86400
+                exp_date = datetime.fromtimestamp(new_pro_until).strftime("%d.%m.%Y %H:%M")
+                await db.execute("UPDATE users SET pro_until = ? WHERE user_id = ?", (new_pro_until, user_id))
+                await db.commit()
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🎉 <b>Оплата через СБП прошла успешно!</b>\n"
+                        f"Тариф <b>«{html.escape(title)}»</b> активен до <b>{exp_date}</b>.\n"
+                        f"Все модели разблокированы в /menu.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+            else:
+                await db.execute(
+                    "UPDATE users SET extra_requests = extra_requests + ? WHERE user_id = ?",
+                    (item_value, user_id),
+                )
+                await db.commit()
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🎉 <b>Оплата через СБП прошла успешно!</b>\n"
+                        f"На твой баланс зачислен <b>пакет на +{item_value} запросов</b>.\n"
+                        f"Проверить остаток можно в /profile.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+        await credit_referral_commission(user_id, rub_amount, title, bot)
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"💰 <b>Новая оплата СБП (Platega)!</b>\n"
+                f"👤 Пользователь: <code>{user_id}</code>\n"
+                f"📦 Тариф: <b>{html.escape(title)}</b>\n"
+                f"💵 Сумма: <b>{rub_amount:.0f} ₽</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return True
+
+
+async def platega_status_watcher(bot: Bot):
+    """Фоновая автопроверка ожидающих платежей Platega каждые 10 секунд."""
+    while True:
+        try:
+            if PLATEGA_MERCHANT_ID and PLATEGA_SECRET:
+                now = time.time()
+                async with aiosqlite.connect(DB_PATH) as db:
+                    db.row_factory = aiosqlite.Row
+                    # Проверяем транзакции не старше 45 минут
+                    async with db.execute(
+                        "SELECT transaction_id, created_at FROM platega_transactions WHERE status = 'PENDING' AND created_at > ?",
+                        (now - 2700,),
+                    ) as cur:
+                        pending_rows = await cur.fetchall()
+
+                for row in pending_rows:
+                    tx_id = row["transaction_id"]
+                    try:
+                        st = await platega_fetch_status(tx_id)
+                        if st == "CONFIRMED":
+                            await fulfill_platega_transaction(tx_id, bot)
+                        elif st in ("CANCELED", "CANCELLED", "EXPIRED", "FAILED"):
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                await db.execute(
+                                    "UPDATE platega_transactions SET status = ? WHERE transaction_id = ?",
+                                    (st, tx_id),
+                                )
+                                await db.commit()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.25)
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+
 # ================= ФОНОВЫЙ ПЛАНИРОВЩИК: СКИДКА 30% НА 36 ЧАСОВ ЧЕРЕЗ 2 ЧАСА =================
 async def delayed_discount_watcher(bot: Bot):
     while True:
@@ -793,7 +1007,7 @@ async def delayed_discount_watcher(bot: Bot):
 
                     offer_text = (
                         f"🔥 <b>ПЕРСОНАЛЬНАЯ СКИДКА {DISCOUNT_PERCENT}% НА 36 ЧАСОВ УЖЕ АКТИВНА!</b>\n\n"
-                        f"Мы снизили цены на <b>{DISCOUNT_PERCENT}%</b> на все подписки и пакеты запросов специально для тебя на ближайшие <b>36 часов</b>:\n\n"
+                        f"Мы снизили цены на <b>{DISCOUNT_PERCENT}%</b> на все подписки и пакеты запросов (от 5 ₽) специально для тебя на ближайшие <b>36 часов</b>:\n\n"
                         "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
                         f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], True)} ⭐)\n"
                         f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], True)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], True)} ⭐)\n"
@@ -927,7 +1141,7 @@ def shop_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👑 Подписка (безлимит PRO)", callback_data="shop:subs")],
-            [InlineKeyboardButton(text="⚡ Пакеты запросов", callback_data="shop:packs")],
+            [InlineKeyboardButton(text="⚡ Пакеты запросов (от 1 шт.)", callback_data="shop:packs")],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_cats")],
         ]
     )
@@ -945,7 +1159,7 @@ def render_shop_main_text(user: dict) -> str:
         f"{disc_line}"
         "Выбери, что хочешь приобрести:\n\n"
         "👑 <b>Подписка</b> — полный безлимит на все PRO-модели (GPT-6, Claude 5, Gemini Pro, Grok) на выбранное количество дней.\n"
-        "⚡ <b>Пакеты запросов</b> — дополнительные запросы, которые не сгорают и расходуются после дневного лимита."
+        "⚡ <b>Пакеты запросов</b> — дополнительные запросы (от 1 шт. за 3 ₽), которые не сгорают и расходуются после дневного лимита."
     )
 
 
@@ -1029,7 +1243,7 @@ def render_shop_packs_text(user: dict) -> str:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
 
     lines.append(
-        f"\nТакже ты можешь указать <b>любое своё количество от {MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS} запросов</b> кнопкой ниже."
+        f"\nТакже ты можешь купить <b>любое количество от {MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS} запросов</b> (от 3 ₽ за 1 запрос) кнопкой ниже."
     )
     return "\n".join(lines)
 
@@ -1082,8 +1296,7 @@ def render_docs_text() -> str:
         "Ознакомься с правилами использования сервиса и политикой обработки данных по ссылкам ниже:\n\n"
         f"• Пользовательское соглашение: {TERMS_URL}\n"
         f"• Политика конфиденциальности: {PRIVACY_URL}\n"
-        f"• Служба поддержки: @{SUPPORT_USERNAME}\n\n"
-        "<i>Максимальная сумма одной транзакции при оплате в рублях — 10 000 ₽.</i>"
+        f"• Служба поддержки: @{SUPPORT_USERNAME}"
     )
 
 
@@ -1111,7 +1324,7 @@ async def cb_docs(call: CallbackQuery):
     await call.answer()
 
 
-# ================= МАГАЗИН: РАЗДЕЛЫ, КАСТОМНЫЙ ВВОД И ОПЛАТА =================
+# ================= МАГАЗИН: РАЗДЕЛЫ, КАСТОМНЫЙ ВВОД И ОПЛАТА (PLATEGA СБП + STARS) =================
 @router.callback_query(F.data == "shop")
 async def cb_shop(call: CallbackQuery, bot: Bot):
     USER_INPUT_STATE.pop(call.from_user.id, None)
@@ -1175,7 +1388,7 @@ async def cb_custom_pack_enter(call: CallbackQuery):
     USER_INPUT_STATE[call.from_user.id] = "await_custom_pack_reqs"
     await call.message.edit_text(
         f"⚡ <b>Свой пакет запросов</b>\n\n"
-        f"Введи нужное количество запросов от <b>{MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS}</b> одним числом (например: <code>20</code> или <code>50</code>):",
+        f"Введи нужное количество запросов от <b>{MIN_CUSTOM_PACK_REQS} до {MAX_CUSTOM_PACK_REQS}</b> одним числом (1 запрос = 3 ₽):",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="shop:packs")]]
         ),
@@ -1241,30 +1454,100 @@ async def cb_pay_sbp(call: CallbackQuery):
         await call.answer("Товар не найден", show_alert=True)
         return
 
-    if order["rub"] > MAX_RUB_TRANSACTION:
-        await call.answer(f"Сумма платежа не может превышать {MAX_RUB_TRANSACTION} ₽.", show_alert=True)
-        return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{order_code}")],
-            [InlineKeyboardButton(text="⬅️ Назад к выбору оплаты", callback_data=f"choose_pay:{order_code}")],
-        ]
-    )
-
+    await call.answer("⏳ Создаю платёжную ссылку СБП...")
     try:
+        tx_data = await platega_create_transaction(
+            amount_rub=order["rub"],
+            description=f"{order['title']} (ID {call.from_user.id})",
+            payload_str=f"{call.from_user.id}:{order_code}",
+        )
+        tx_id = tx_data["transaction_id"]
+        pay_url = tx_data["redirect"]
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO platega_transactions
+                (transaction_id, user_id, order_code, title, item_type, item_value, rub_amount, redirect_url, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                """,
+                (
+                    tx_id,
+                    call.from_user.id,
+                    order_code,
+                    order["title"],
+                    order["type"],
+                    order["value"],
+                    float(order["rub"]),
+                    pay_url,
+                    time.time(),
+                ),
+            )
+            await db.commit()
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"💳 Перейти к оплате ({order['rub']} ₽)", url=pay_url)],
+                [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"chk_sbp:{tx_id}")],
+                [InlineKeyboardButton(text="⬅️ Назад к выбору оплаты", callback_data=f"choose_pay:{order_code}")],
+            ]
+        )
+
         await call.message.edit_text(
-            f"💳 <b>Оплата через СБП (Platega)</b>\n\n"
+            f"💳 <b>Счёт на оплату через СБП создан!</b>\n\n"
             f"📦 Тариф: <b>{order['title']}</b>\n"
-            f"💰 К оплате: <b>{order['rub']} ₽</b>\n\n"
-            f"<i>Платёжный шлюз СБП находится на финальной проверке банка. "
-            f"Пока шлюз подключается, ты можешь моментально оплатить тариф через Telegram Stars кнопкой ниже или написать в поддержку @{SUPPORT_USERNAME}.</i>",
+            f"💰 Сумма: <b>{order['rub']} ₽</b>\n"
+            f"🆔 Номер платежа: <code>{tx_id}</code>\n\n"
+            f"1. Нажми <b>«Перейти к оплате»</b> и оплати по СБП.\n"
+            f"2. После оплаты подписка или запросы начислятся <b>автоматически в течение 10–15 секунд</b> (или нажми «Проверить оплату»).",
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
         )
-    except TelegramBadRequest:
-        pass
-    await call.answer()
+    except Exception as e:
+        await call.message.edit_text(
+            f"⚠️ <b>Не удалось создать платёж СБП:</b>\n<code>{html.escape(str(e)[:250])}</code>\n\n"
+            f"Попробуй оплатить через Telegram Stars или обратись в поддержку @{SUPPORT_USERNAME}.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⭐ Оплатить через Telegram Stars", callback_data=f"pay_stars:{order_code}")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"choose_pay:{order_code}")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@router.callback_query(F.data.startswith("chk_sbp:"))
+async def cb_chk_sbp(call: CallbackQuery, bot: Bot):
+    tx_id = call.data.split(":", 1)[1]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM platega_transactions WHERE transaction_id = ?", (tx_id,)) as cur:
+            tx = await cur.fetchone()
+
+    if not tx:
+        await call.answer("Транзакция не найдена.", show_alert=True)
+        return
+
+    if tx["status"] == "CONFIRMED":
+        await call.answer("✅ Оплата уже подтверждена и зачислена!", show_alert=True)
+        return
+
+    st = await platega_fetch_status(tx_id)
+    if st == "CONFIRMED":
+        await fulfill_platega_transaction(tx_id, bot)
+        await call.answer("✅ Оплата подтверждена! Доступ начислен.", show_alert=True)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+    elif st in ("CANCELED", "CANCELLED", "EXPIRED", "FAILED"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE platega_transactions SET status = ? WHERE transaction_id = ?", (st, tx_id))
+            await db.commit()
+        await call.answer("❌ Срок действия платежа истёк или платёж отменён.", show_alert=True)
+    else:
+        await call.answer("⏳ Платёж ещё не поступил. Если ты уже оплатил — подожди 10 секунд и нажми снова.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("pay_stars:"))
@@ -1283,7 +1566,7 @@ async def cb_pay_stars(call: CallbackQuery):
         desc = f"Пакет на {order['value']} дополнительных запросов."
 
     await call.message.answer_invoice(
-        title=order["title"] + (f" (Скидка {DISCOUNT_PERCENT}%)" if disc else ""),
+        title=order["title"] + (f" (Скидка {DISCOUNT_PERCENT}%)" if (disc and order["stars"] >= 5) else ""),
         description=desc,
         payload=f"ord:{order_code}",
         currency="XTR",
@@ -1326,8 +1609,8 @@ async def successful_payment(message: Message, bot: Bot):
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO payments (user_id, product_key, title, stars, paid_at) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, order["order_code"], order["title"], paid_stars, time.time()),
+            "INSERT INTO payments (user_id, product_key, title, stars, rub_amount, method, paid_at) VALUES (?, ?, ?, ?, ?, 'stars', ?)",
+            (message.from_user.id, order["order_code"], order["title"], paid_stars, rub_equivalent, time.time()),
         )
 
         if order["type"] == "sub":
@@ -2039,7 +2322,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
             refs_count = (await cur.fetchone())[0]
 
         async with db.execute(
-            "SELECT title, stars, paid_at FROM payments WHERE user_id = ? ORDER BY paid_at DESC LIMIT 10",
+            "SELECT title, stars, rub_amount, method, paid_at FROM payments WHERE user_id = ? ORDER BY paid_at DESC LIMIT 10",
             (target_id,),
         ) as cur:
             pay_rows = await cur.fetchall()
@@ -2050,11 +2333,21 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         ) as cur:
             total_stars = (await cur.fetchone())[0]
 
+        async with db.execute(
+            "SELECT COALESCE(SUM(rub_amount), 0) FROM payments WHERE user_id = ? AND method = 'sbp'",
+            (target_id,),
+        ) as cur:
+            total_sbp_rub = (await cur.fetchone())[0]
+
     if pay_rows:
         pay_lines = []
         for p in pay_rows:
             p_date = datetime.fromtimestamp(p["paid_at"]).strftime("%d.%m.%y %H:%M")
-            pay_lines.append(f"  • {html.escape(p['title'])} — <b>{p['stars']} ⭐</b> ({p_date})")
+            if p["method"] == "sbp":
+                val_str = f"{p['rub_amount']:.0f} ₽ (СБП)"
+            else:
+                val_str = f"{p['stars']} ⭐"
+            pay_lines.append(f"  • {html.escape(p['title'])} — <b>{val_str}</b> ({p_date})")
         payments_block = "\n".join(pay_lines)
     else:
         payments_block = "  <i>Покупок пока нет</i>"
@@ -2078,7 +2371,7 @@ async def render_user_card(target_id: int, back_page: int = 0) -> tuple[str, Inl
         f"📦 Запросы из пакета: <b>{user.get('extra_requests', 0)} шт.</b>\n"
         f"🎁 Бонус к дневному лимиту: <b>+{user['bonus_limit']} в день</b>\n"
         f"📊 Всего запросов за всё время: <b>{user.get('total_requests', 0)}</b>\n\n"
-        f"💳 <b>История покупок (всего на {total_stars} ⭐):</b>\n"
+        f"💳 <b>История покупок (СБП: {total_sbp_rub:.0f} ₽ | Stars: {total_stars} ⭐):</b>\n"
         f"{payments_block}"
     )
 
@@ -2479,16 +2772,20 @@ async def render_admin_text() -> str:
             promos_count = (await cur.fetchone())[0]
         async with db.execute("SELECT COALESCE(SUM(stars), 0) FROM payments") as cur:
             total_stars = (await cur.fetchone())[0]
+        async with db.execute("SELECT COALESCE(SUM(rub_amount), 0) FROM payments WHERE method = 'sbp'") as cur:
+            total_sbp_rub = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'") as cur:
             pending_w = (await cur.fetchone())[0]
 
+    platega_status = "🟢 Подключена" if (PLATEGA_MERCHANT_ID and PLATEGA_SECRET) else "🔴 Не заданы ключи"
+
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
+        f"💳 Platega СБП: <b>{platega_status}</b>\n"
         f"⚙️ Общий движок (текст и фото): <code>{engine}</code>\n"
-        f"👑 Для админа: <b>работают выбранные в меню модели</b>\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
-        f"⭐ Заработано за всё время: <b>{total_stars} ⭐</b>\n"
+        f"💰 Касса СБП: <b>{total_sbp_rub:.0f} ₽</b> | Stars: <b>{total_stars} ⭐</b>\n"
         f"💸 Заявок на вывод: <b>{pending_w} шт.</b>\n"
         f"🎟 Создано промокодов: <b>{promos_count}</b>\n"
         f"⚡ Запросов сегодня: <b>{today_reqs}</b>\n\n"
@@ -3057,7 +3354,6 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
     total_cost = count * PHOTO_COST
     pro_active = is_pro(user) or (user_id == ADMIN_ID)
 
-    # Жёстко проверяем и списываем квоту ровно на количество фото (чтобы не выходить за лимит)
     quota_receipt = await try_consume_quota(user_id, pro_active, count=total_cost)
     if not quota_receipt:
         total_limit = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
@@ -3181,7 +3477,7 @@ async def handle_prompt(message: Message, bot: Bot):
         await send_payment_method_choice(message, user_id, f"csub:{days}", edit=False)
         return
 
-    # 2. Ввод своего количества запросов в пакет (10–500)
+    # 2. Ввод своего количества запросов в пакет (1–500)
     if state == "await_custom_pack_reqs":
         if not text_in.isdigit() or not (MIN_CUSTOM_PACK_REQS <= int(text_in) <= MAX_CUSTOM_PACK_REQS):
             await message.answer(
@@ -3484,6 +3780,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
     asyncio.create_task(delayed_discount_watcher(bot))
+    asyncio.create_task(platega_status_watcher(bot))
     dp = Dispatcher()
     dp.include_router(router)
     print("Бот запущен!")
