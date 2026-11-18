@@ -564,6 +564,17 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS request_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                req_type TEXT,
+                user_query TEXT,
+                bot_reply TEXT,
+                model_used TEXT,
+                created_at REAL
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
@@ -650,6 +661,29 @@ async def add_history(user_id: int, role: str, content: str):
             )
             """,
             (user_id, user_id, MAX_HISTORY_MESSAGES),
+        )
+        await db.commit()
+
+
+async def log_user_request(user_id: int, req_type: str, user_query: str, bot_reply: str, model_used: str = ""):
+    """Сохраняет постоянный журнал всех запросов пользователей (не стирается при /clear) для аудита в админке."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO request_logs (user_id, req_type, user_query, bot_reply, model_used, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, req_type, (user_query or "")[:2000], (bot_reply or "")[:2000], model_used[:60], time.time()),
+        )
+        # Храним последние 100 записей на каждого пользователя, чтобы база не раздувалась
+        await db.execute(
+            """
+            DELETE FROM request_logs
+            WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM request_logs WHERE user_id = ? ORDER BY id DESC LIMIT 100
+            )
+            """,
+            (user_id, user_id),
         )
         await db.commit()
 
@@ -1327,6 +1361,7 @@ async def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
+            [InlineKeyboardButton(text="📜 История запросов", callback_data="adm_req_hist:0")],
             [InlineKeyboardButton(text=w_label, callback_data="adm_withdrawals")],
             [InlineKeyboardButton(text=g_disc_label, callback_data="adm_gdisc_menu")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
@@ -1936,47 +1971,127 @@ async def cb_adm_w_no(call: CallbackQuery, bot: Bot):
     await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-# ================= ВИДЕО, КРУЖОЧКИ И АУДИО (УНИВЕРСАЛЬНЫЙ ШЛЮЗ + РАСКАДРОВКА) =================
-async def extract_video_frames_b64(raw_bytes: bytes, max_frames: int = 5) -> list[str]:
-    """Извлекает ключевые кадры (JPEG base64) из видео/кружочка через ffmpeg или cv2,
-    чтобы любую видеозапись можно было разобрать через обычные Vision-модели (GPT-6 / Claude / Gemini)."""
+# ================= ВИДЕО, КРУЖОЧКИ И АУДИО (УНИВЕРСАЛЬНЫЙ ШЛЮЗ + АВТО-РАСКАДРОВКА) =================
+_FFMPEG_BIN_CACHE: str | None = None
+
+
+def _get_or_install_ffmpeg() -> str | None:
+    """Находит системный ffmpeg, imageio_ffmpeg или автоматически ставит imageio-ffmpeg в пользовательское окружение."""
+    global _FFMPEG_BIN_CACHE
+    if _FFMPEG_BIN_CACHE and os.path.exists(_FFMPEG_BIN_CACHE):
+        return _FFMPEG_BIN_CACHE
+
+    fb = shutil.which("ffmpeg")
+    if fb:
+        _FFMPEG_BIN_CACHE = fb
+        return fb
+
+    try:
+        import imageio_ffmpeg
+        fb = imageio_ffmpeg.get_ffmpeg_exe()
+        if fb and os.path.exists(fb):
+            _FFMPEG_BIN_CACHE = fb
+            return fb
+    except Exception:
+        pass
+
+    # Пробуем тихо подтянуть imageio-ffmpeg на хостинг (bothost / linux)
+    try:
+        import subprocess
+        import sys
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "imageio-ffmpeg"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=45,
+        )
+        import imageio_ffmpeg
+        fb = imageio_ffmpeg.get_ffmpeg_exe()
+        if fb and os.path.exists(fb):
+            _FFMPEG_BIN_CACHE = fb
+            return fb
+    except Exception:
+        pass
+
+    return None
+
+
+def _extract_jpeg_frames_from_mp4_bytes(raw_bytes: bytes, max_frames: int = 5) -> list[str]:
+    """Резервный парсер встроенных JPEG/MJPEG кадров или I-кадров без внешних библиотек."""
+    frames: list[str] = []
+    start = 0
+    while len(frames) < max_frames:
+        soi = raw_bytes.find(b"\xff\xd8\xff", start)
+        if soi == -1:
+            break
+        eoi = raw_bytes.find(b"\xff\xd9", soi + 3)
+        if eoi == -1:
+            break
+        chunk = raw_bytes[soi : eoi + 2]
+        if len(chunk) > 2048:
+            frames.append(base64.b64encode(chunk).decode("utf-8"))
+        start = eoi + 2
+    return frames
+
+
+async def extract_video_frames_and_audio(raw_bytes: bytes, max_frames: int = 5) -> tuple[list[str], bytes | None]:
+    """Извлекает ключевые кадры (JPEG base64) и WAV/MP3-дорожку из видео/кружочка."""
     import subprocess
     import tempfile
 
-    def _run_extract() -> list[str]:
+    def _run_extract() -> tuple[list[str], bytes | None]:
         frames: list[str] = []
+        audio_bytes: bytes | None = None
         with tempfile.TemporaryDirectory() as tmpdir:
             in_path = os.path.join(tmpdir, "input.mp4")
             with open(in_path, "wb") as f:
                 f.write(raw_bytes)
 
-            # 1. Пробуем системный ffmpeg (или imageio_ffmpeg)
-            ffmpeg_bin = shutil.which("ffmpeg")
-            if not ffmpeg_bin:
-                try:
-                    import imageio_ffmpeg
-                    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-                except Exception:
-                    ffmpeg_bin = None
-
+            ffmpeg_bin = _get_or_install_ffmpeg()
             if ffmpeg_bin:
                 out_pattern = os.path.join(tmpdir, "frame_%02d.jpg")
-                cmd = [
+                cmd_frames = [
                     ffmpeg_bin, "-y", "-i", in_path,
-                    "-vf", "fps=1,scale='min(720,iw)':-1",
+                    "-vf", "fps=1,scale='min(640,iw)':-1",
                     "-frames:v", str(max_frames),
                     "-q:v", "4",
                     out_pattern,
                 ]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                subprocess.run(cmd_frames, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
                 for fn in sorted(os.listdir(tmpdir)):
                     if fn.startswith("frame_") and fn.endswith(".jpg"):
                         with open(os.path.join(tmpdir, fn), "rb") as img_f:
                             frames.append(base64.b64encode(img_f.read()).decode("utf-8"))
-                if frames:
-                    return frames
 
-            # 2. Резерв через OpenCV (cv2), если установлен на хостинге
+                # Если видео короче 1 секунды и fps=1 не дал кадров — берём самый первый кадр
+                if not frames:
+                    first_frame = os.path.join(tmpdir, "first.jpg")
+                    subprocess.run(
+                        [ffmpeg_bin, "-y", "-i", in_path, "-vframes", "1", "-q:v", "4", first_frame],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                    )
+                    if os.path.exists(first_frame):
+                        with open(first_frame, "rb") as img_f:
+                            frames.append(base64.b64encode(img_f.read()).decode("utf-8"))
+
+                # Извлекаем аудиодорожку (mp3)
+                out_audio = os.path.join(tmpdir, "audio.mp3")
+                subprocess.run(
+                    [ffmpeg_bin, "-y", "-i", in_path, "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", out_audio],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                )
+                if os.path.exists(out_audio) and os.path.getsize(out_audio) > 512:
+                    with open(out_audio, "rb") as af:
+                        audio_bytes = af.read()
+
+                if frames or audio_bytes:
+                    return frames, audio_bytes
+
+            # Резерв через OpenCV (cv2)
             try:
                 import cv2
                 cap = cv2.VideoCapture(in_path)
@@ -1995,7 +2110,11 @@ async def extract_video_frames_b64(raw_bytes: bytes, max_frames: int = 5) -> lis
                 cap.release()
             except Exception:
                 pass
-        return frames
+
+            if not frames:
+                frames = _extract_jpeg_frames_from_mp4_bytes(raw_bytes, max_frames=max_frames)
+
+        return frames, audio_bytes
 
     return await asyncio.to_thread(_run_extract)
 
@@ -2003,7 +2122,7 @@ async def extract_video_frames_b64(raw_bytes: bytes, max_frames: int = 5) -> lis
 async def generate_media_multimodal_response(
     user_id: int, selected_model: str, caption: str, b64_data: str, mime_type: str
 ) -> str:
-    """Пробует отправить медиафайл через input_audio / image_url / file по всем доступным моделям."""
+    """Пробует отправить медиафайл через input_audio / image_url по доступным моделям (без зависания на 404)."""
     candidates = await get_candidates_for_user(user_id, selected_model)
     for m in VIDEO_FALLBACK_MODELS:
         if m not in candidates:
@@ -2029,7 +2148,7 @@ async def generate_media_multimodal_response(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
-        for candidate_id in candidates:
+        for candidate_id in candidates[:4]:
             try:
                 response = await asyncio.wait_for(
                     ai_client.chat.completions.create(
@@ -2037,7 +2156,7 @@ async def generate_media_multimodal_response(
                         messages=messages_payload,
                         max_tokens=1500,
                     ),
-                    timeout=25.0,
+                    timeout=20.0,
                 )
                 content = response.choices[0].message.content
                 if content:
@@ -2045,9 +2164,9 @@ async def generate_media_multimodal_response(
             except Exception as e:
                 last_error = e
                 err_s = str(e)
-                # Если модель не поддерживает этот формат (400/404/422), быстро переходим дальше
-                if any(code in err_s for code in ("404", "400", "422", "unsupported", "not found")):
-                    continue
+                # Если шлюз целиком не поддерживает этот формат (404 на роуте), сразу выходим из цикла моделей
+                if "Error code: 404" in err_s:
+                    break
                 continue
 
     raise last_error or RuntimeError("Модели обработки медиа временно недоступны")
@@ -2070,13 +2189,16 @@ async def transcribe_audio_whisper(raw_bytes: bytes, filename: str = "voice.ogg"
                     model=wm,
                     file=audio_bio,
                 ),
-                timeout=18.0,
+                timeout=15.0,
             )
             txt = (getattr(transcript, "text", None) or "").strip()
             if txt:
                 return txt
         except Exception as e:
             last_err = e
+            err_s = str(e)
+            if "404" in err_s or "503" in err_s or "No available accounts" in err_s:
+                break
             continue
     if last_err:
         raise last_err
@@ -2121,6 +2243,7 @@ async def handle_video(message: Message, bot: Bot):
 
     shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
     media_label = "кружочек" if is_circle else "видео"
+    req_type_tag = "⭕ Кружочек" if is_circle else "🎬 Видео"
     wait_msg = await message.answer(f"🎬 <i>Анализирую {media_label} ({shown_model})...</i>", parse_mode=ParseMode.HTML)
 
     try:
@@ -2139,62 +2262,74 @@ async def handle_video(message: Message, bot: Bot):
             caption = (message.caption or "").strip() or "Подробно разбери, что происходит на этом видео, и ответь на задание или вопрос."
 
         answer_text = None
+        speech_text = ""
 
-        # Попытка 1: прямая отправка видеофайла в мультимодальный шлюз
-        try:
-            answer_text = await generate_media_multimodal_response(
-                user_id=user_id,
-                selected_model=model_id,
-                caption=caption,
-                b64_data=b64_video,
-                mime_type=mime_type,
-            )
-        except Exception:
-            answer_text = None
-
-        # Попытка 2: извлекаем кадры + расшифровываем речь из видео и отправляем через обычный Vision (работает 100% как фото!)
-        if not answer_text:
-            speech_text = ""
+        # Шаг 1: раскадровка + извлечение аудио (работает через Vision на любом шлюзе, даже если видео 404!)
+        frames_b64, extracted_audio = await extract_video_frames_and_audio(raw_bytes, max_frames=5)
+        if extracted_audio or raw_bytes:
             try:
-                speech_text = await transcribe_audio_whisper(raw_bytes, filename="video.mp4")
+                speech_text = await transcribe_audio_whisper(
+                    extracted_audio or raw_bytes,
+                    filename="circle.mp3" if extracted_audio else "circle.mp4",
+                )
             except Exception:
                 speech_text = ""
 
-            if speech_text and is_content_forbidden(speech_text):
-                await refund_quota(user_id, quota_receipt)
-                await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
-                return
+        if speech_text and is_content_forbidden(speech_text):
+            await refund_quota(user_id, quota_receipt)
+            await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+            return
 
-            frames_b64 = await extract_video_frames_b64(raw_bytes, max_frames=5)
-            if frames_b64:
-                frame_prompt = caption
-                if speech_text:
-                    frame_prompt += f"\n\nРасшифровка речи из видео: «{speech_text}»"
-                else:
-                    frame_prompt += f"\n(Это {len(frames_b64)} последовательных кадров из {media_label}а)."
-                answer_text = await generate_photos_response(
-                    user_id=user_id,
-                    selected_model=model_id,
-                    caption=frame_prompt,
-                    b64_images=frames_b64,
-                )
-            elif speech_text:
-                history = await get_history(user_id)
-                answer_text = await generate_text_response(
-                    user_id=user_id,
-                    selected_model=model_id,
-                    history=history,
-                    user_text=f"{caption}\n\nРечь из {media_label}а: {speech_text}",
-                )
+        if frames_b64:
+            frame_prompt = caption
+            if speech_text:
+                frame_prompt += f"\n\nРасшифровка речи из {media_label}а: «{speech_text}»"
             else:
-                raise RuntimeError(
-                    "Текущий API-шлюз не поддерживает прямую загрузку видео (404), "
-                    "а на сервере не установлен ffmpeg для нарезки кадров."
-                )
+                frame_prompt += f"\n(Это {len(frames_b64)} последовательных кадров из {media_label}а пользователя)."
+            answer_text = await generate_photos_response(
+                user_id=user_id,
+                selected_model=model_id,
+                caption=frame_prompt,
+                b64_images=frames_b64,
+            )
 
-        hist_label = "[Отправил кружочек]" if is_circle else f"[Отправил видео с подписью: {caption}]"
-        await add_history(user_id, "user", hist_label)
+        # Шаг 2: если кадры не извлеклись — пробуем прямую отправку видео в мультимодальный шлюз
+        if not answer_text:
+            try:
+                answer_text = await generate_media_multimodal_response(
+                    user_id=user_id,
+                    selected_model=model_id,
+                    caption=caption,
+                    b64_data=b64_video,
+                    mime_type=mime_type,
+                )
+            except Exception:
+                answer_text = None
+
+        # Шаг 3: если есть только расшифровка речи из кружочка — отвечаем по речи
+        if not answer_text and speech_text:
+            history = await get_history(user_id)
+            answer_text = await generate_text_response(
+                user_id=user_id,
+                selected_model=model_id,
+                history=history,
+                user_text=f"{caption}\n\nРечь из {media_label}а: {speech_text}",
+            )
+
+        if not answer_text:
+            raise RuntimeError(
+                "API-шлюз отклонил прямой видеофайл (404), а на хостинге не установлен ffmpeg/imageio-ffmpeg для раскадровки."
+            )
+
+        if is_circle:
+            log_q = f"[Кружочек]{' | Речь: ' + speech_text if speech_text else ' (видеоряд)'}"
+        else:
+            raw_cap = (message.caption or "").strip() or "без подписи"
+            log_q = f"[Видео: {raw_cap}]{' | Речь: ' + speech_text if speech_text else ''}"
+
+        await add_history(user_id, "user", log_q)
         await add_history(user_id, "assistant", answer_text)
+        await log_user_request(user_id, req_type_tag, log_q, answer_text, model_used=shown_model)
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -2249,6 +2384,8 @@ async def handle_voice(message: Message, bot: Bot):
         )
         return
 
+    shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
+    req_type_tag = "🎙 Голосовое" if message.voice else "🎵 Аудио"
     wait_msg = await message.answer("🎙 <i>Слушаю голосовое и готовлю ответ...</i>", parse_mode=ParseMode.HTML)
     try:
         file_info = await bot.get_file(voice_obj.file_id)
@@ -2281,8 +2418,10 @@ async def handle_voice(message: Message, bot: Bot):
                 history=history,
                 user_text=full_user_prompt,
             )
+            log_q = f"[ГС]: {recognized_text}" + (f" (подпись: {extra_caption})" if extra_caption else "")
             await add_history(user_id, "user", full_user_prompt)
             await add_history(user_id, "assistant", answer_text)
+            await log_user_request(user_id, req_type_tag, log_q, answer_text, model_used=shown_model)
 
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
@@ -2303,8 +2442,10 @@ async def handle_voice(message: Message, bot: Bot):
                 b64_data=b64_audio,
                 mime_type=mime_audio,
             )
-            await add_history(user_id, "user", f"[Голосовое сообщение]{': ' + extra_caption if extra_caption else ''}")
+            log_q = f"[Голосовое сообщение]{': ' + extra_caption if extra_caption else ''}"
+            await add_history(user_id, "user", log_q)
             await add_history(user_id, "assistant", answer_text)
+            await log_user_request(user_id, req_type_tag, log_q, answer_text, model_used=shown_model)
 
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
@@ -2318,7 +2459,7 @@ async def handle_voice(message: Message, bot: Bot):
         err_msg = str(e)
         if "503" in err_msg or "No available accounts" in err_msg or "404" in err_msg:
             human_err = (
-                "На сервере API сейчас нет свободных аккаунтов для распознавания аудио/видео "
+                "На сервере API сейчас нет свободных аккаунтов для распознавания аудио "
                 f"(<code>{html.escape(err_msg[:140])}</code>). Попробуй чуть позже или напиши текстом / скинь фото."
             )
         else:
@@ -2429,8 +2570,11 @@ async def handle_document(message: Message, bot: Bot):
             user_text=combined_prompt,
         )
 
+        shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
+        doc_log_q = f"[Файл {fname}]: {task_caption}\n{file_text[:600]}"
         await add_history(user_id, "user", f"[Файл {fname}]: {task_caption}\n{file_text[:1500]}")
         await add_history(user_id, "assistant", answer_text)
+        await log_user_request(user_id, "📄 Файл", doc_log_q, answer_text, model_used=shown_model)
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
@@ -2508,6 +2652,196 @@ async def cb_adm_broadcast_confirm(call: CallbackQuery, bot: Bot):
         reply_markup=await admin_kb(),
         parse_mode=ParseMode.HTML,
     )
+
+
+# ================= АДМИН: ИСТОРИЯ ЗАПРОСОВ ПОЛЬЗОВАТЕЛЕЙ (АНТИ-ДЖЕЙЛБРЕЙК АУДИТ) =================
+async def render_req_hist_users_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    offset = page * USERS_PER_PAGE
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT COUNT(DISTINCT u.user_id)
+            FROM users u
+            WHERE u.total_requests > 0
+               OR EXISTS (SELECT 1 FROM request_logs rl WHERE rl.user_id = u.user_id)
+            """
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
+        async with db.execute(
+            """
+            SELECT u.user_id, u.full_name, u.username, u.total_requests,
+                   (SELECT COUNT(*) FROM request_logs rl WHERE rl.user_id = u.user_id) AS logged_cnt,
+                   (SELECT MAX(created_at) FROM request_logs rl WHERE rl.user_id = u.user_id) AS last_ts
+            FROM users u
+            WHERE u.total_requests > 0
+               OR EXISTS (SELECT 1 FROM request_logs rl WHERE rl.user_id = u.user_id)
+            ORDER BY COALESCE(last_ts, 0) DESC, u.total_requests DESC
+            LIMIT ? OFFSET ?
+            """,
+            (USERS_PER_PAGE, offset),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if total == 0:
+        return (
+            "📜 <b>История запросов</b>\n\n<i>Пока ни один пользователь не делал запросов.</i>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]]
+            ),
+        )
+
+    total_pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    lines = [
+        f"📜 <b>История запросов (стр. {page + 1}/{total_pages}, активных профилей: {total})</b>\n",
+        "Выбери профиль ниже, чтобы посмотреть все его текстовые запросы, фото, кружочки и голосовые:\n",
+    ]
+    buttons = []
+
+    for r in rows:
+        uid = r["user_id"]
+        name = r["full_name"] or "Без имени"
+        uname = f" @{r['username']}" if r["username"] else ""
+        cnt = max(r["logged_cnt"] or 0, r["total_requests"] or 0)
+        last_str = datetime.fromtimestamp(r["last_ts"]).strftime("%d.%m %H:%M") if r["last_ts"] else "ранее"
+        lines.append(f"• <b>{html.escape(name)}</b>{html.escape(uname)} (<code>{uid}</code>) — <b>{cnt}</b> запр. ({last_str})")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"👤 {name[:20]} | {cnt} запр. ({last_str})",
+                callback_data=f"adm_rh_u:{uid}:0:{page}",
+            )
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_req_hist:{page - 1}"))
+    if offset + USERS_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"adm_req_hist:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton(text="🔍 Найти историю по ID / нику", callback_data="adm_rh_search")])
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def render_user_req_logs(target_id: int, log_page: int = 0, users_page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    LOGS_PER_PAGE = 5
+    offset = log_page * LOGS_PER_PAGE
+    user = await get_user(target_id)
+    name = html.escape(user.get("full_name") or "Пользователь")
+    uname = f" (@{user['username']})" if user.get("username") else ""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT COUNT(*) FROM request_logs WHERE user_id = ?", (target_id,)) as cur:
+            total_logs = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT * FROM request_logs WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (target_id, LOGS_PER_PAGE, offset),
+        ) as cur:
+            logs = await cur.fetchall()
+
+        # Если детальных логов ещё нет (старые запросы до обновления), подтягиваем из chat_history
+        fallback_hist = []
+        if total_logs == 0:
+            async with db.execute(
+                "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+                (target_id,),
+            ) as cur2:
+                fallback_hist = await cur2.fetchall()
+
+    header = (
+        f"📜 <b>Запросы пользователя: {name}</b>{uname}\n"
+        f"🆔 ID: <code>{target_id}</code> | Всего запросов: <b>{user.get('total_requests', 0)}</b>\n"
+    )
+
+    if total_logs == 0 and not fallback_hist:
+        body = "\n<i>Детальная история запросов этого пользователя пока пуста (записи появятся после новых сообщений).</i>"
+    elif total_logs == 0 and fallback_hist:
+        chunks = ["\n<i>Последние сообщения из оперативной памяти чата:</i>\n"]
+        for fh in reversed(fallback_hist):
+            who = "👤 Запрос" if fh["role"] == "user" else "🤖 Ответ"
+            snippet = html.escape((fh["content"] or "")[:320])
+            chunks.append(f"<b>{who}:</b> <code>{snippet}</code>")
+        body = "\n".join(chunks)
+    else:
+        total_pages = max(1, (total_logs + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE)
+        chunks = [f"📄 Страница <b>{log_page + 1}/{total_pages}</b> (записей в журнале: {total_logs})\n"]
+        for item in logs:
+            dt_s = datetime.fromtimestamp(item["created_at"]).strftime("%d.%m.%Y %H:%M") if item["created_at"] else ""
+            rtype = html.escape(item["req_type"] or "💬 Запрос")
+            m_used = f" • <i>{html.escape(item['model_used'])}</i>" if item["model_used"] else ""
+            q_txt = html.escape((item["user_query"] or "")[:350])
+            a_txt = html.escape((item["bot_reply"] or "")[:220])
+            chunks.append(
+                f"🕒 <b>{dt_s}</b> | {rtype}{m_used}\n"
+                f"👤 <b>Запрос:</b> <code>{q_txt}</code>\n"
+                f"🤖 <b>Ответ:</b> {a_txt}\n"
+                f"────────────────────"
+            )
+        body = "\n".join(chunks)
+
+    buttons = []
+    if total_logs > 0:
+        nav = []
+        if log_page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Новее", callback_data=f"adm_rh_u:{target_id}:{log_page - 1}:{users_page}"))
+        if offset + LOGS_PER_PAGE < total_logs:
+            nav.append(InlineKeyboardButton(text="Старее ➡️", callback_data=f"adm_rh_u:{target_id}:{log_page + 1}:{users_page}"))
+        if nav:
+            buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="👤 Открыть карточку профиля", callback_data=f"adm_u_view:{target_id}:{users_page}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку профилей", callback_data=f"adm_req_hist:{users_page}")])
+
+    full_text = header + body
+    if len(full_text) > 4000:
+        full_text = full_text[:3980] + "..."
+    return full_text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data.startswith("adm_req_hist:"))
+async def cb_adm_req_hist(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    page = int(call.data.split(":", 1)[1])
+    text, kb = await render_req_hist_users_page(page)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_rh_search")
+async def cb_adm_rh_search(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE[ADMIN_ID] = "adm_rh_search"
+    await call.message.edit_text(
+        "🔍 <b>Поиск истории запросов</b>\n\n"
+        "Отправь <b>ID пользователя</b>, его <b>@username</b> или часть <b>имени</b>:",
+        reply_markup=admin_cancel_kb("adm_req_hist:0"),
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm_rh_u:"))
+async def cb_adm_rh_u(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    _, uid_s, lpage_s, upage_s = call.data.split(":")
+    text, kb = await render_user_req_logs(int(uid_s), int(lpage_s), int(upage_s))
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
 
 
 # ================= АДМИН: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =================
@@ -3940,8 +4274,16 @@ async def process_photo_batch(messages: list[Message], bot: Bot):
             b64_images=b64_list,
         )
 
+        shown_model = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
+        raw_photo_cap = ""
+        for m in messages:
+            if m.caption:
+                raw_photo_cap = m.caption.strip()
+                break
+        photo_log_q = f"[{count} фото]" + (f": {raw_photo_cap}" if raw_photo_cap else " (без подписи)")
         await add_history(user_id, "user", f"[Отправил {count} фото с подписью: {caption}]")
         await add_history(user_id, "assistant", answer_text)
+        await log_user_request(user_id, "📸 Фото", photo_log_q, answer_text, model_used=shown_model)
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -4143,6 +4485,30 @@ async def handle_prompt(message: Message, bot: Bot):
             await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
             return
 
+        elif action == "adm_rh_search":
+            q = text_in.lstrip("@").strip()
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                if q.isdigit():
+                    async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(q),)) as cur:
+                        row = await cur.fetchone()
+                else:
+                    async with db.execute(
+                        "SELECT user_id FROM users WHERE username LIKE ? OR full_name LIKE ? LIMIT 1",
+                        (f"%{q}%", f"%{q}%"),
+                    ) as cur:
+                        row = await cur.fetchone()
+
+            if not row:
+                await message.answer(
+                    "❌ Пользователь не найден в базе.",
+                    reply_markup=admin_cancel_kb("adm_req_hist:0"),
+                )
+                return
+            text, kb = await render_user_req_logs(row["user_id"], 0, 0)
+            await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+
         elif action.startswith("adm_u_pro_cust:"):
             _, uid_s, page_s = action.split(":")
             if not text_in.isdigit() or int(text_in) <= 0:
@@ -4311,8 +4677,10 @@ async def handle_prompt(message: Message, bot: Bot):
             user_text=message.text,
         )
 
+        shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
         await add_history(user_id, "user", message.text)
         await add_history(user_id, "assistant", answer_text)
+        await log_user_request(user_id, "💬 Текст", message.text, answer_text, model_used=shown_model)
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
