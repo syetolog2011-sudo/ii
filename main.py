@@ -1940,11 +1940,12 @@ async def cb_adm_w_no(call: CallbackQuery, bot: Bot):
 async def generate_video_response(
     user_id: int, selected_model: str, caption: str, b64_video: str, mime_type: str
 ) -> str:
-    if user_id == ADMIN_ID and selected_model:
-        candidates = [selected_model] + [m for m in VIDEO_FALLBACK_MODELS if m != selected_model]
+    # Видео и аудио в OpenAI-совместимых шлюзах корректно принимают только модели Gemini;
+    # если у админа выбрана Gemini — ставим её первой, иначе сразу идём по Gemini-моделям.
+    if user_id == ADMIN_ID and selected_model and "gemini" in selected_model.lower():
+        candidates = [selected_model] + [m for m in VIDEO_FALLBACK_MODELS if m != selected_model and "gemini" in m]
     else:
-        engine = await get_engine_model()
-        candidates = [engine] + [m for m in VIDEO_FALLBACK_MODELS if m != engine]
+        candidates = [m for m in VIDEO_FALLBACK_MODELS if "gemini" in m]
 
     user_content = [
         {"type": "text", "text": caption},
@@ -1958,10 +1959,13 @@ async def generate_video_response(
     last_error = None
     for candidate_id in candidates:
         try:
-            response = await ai_client.chat.completions.create(
-                model=candidate_id,
-                messages=messages_payload,
-                max_tokens=1500,
+            response = await asyncio.wait_for(
+                ai_client.chat.completions.create(
+                    model=candidate_id,
+                    messages=messages_payload,
+                    max_tokens=1500,
+                ),
+                timeout=30.0,
             )
             content = response.choices[0].message.content
             if content:
@@ -1970,7 +1974,7 @@ async def generate_video_response(
             last_error = e
             continue
 
-    raise last_error or RuntimeError("Выбранная модель временно не смогла обработать видео")
+    raise last_error or RuntimeError("Модели обработки видео/аудио временно недоступны")
 
 
 @router.message(F.video | F.video_note)
@@ -2041,9 +2045,12 @@ async def handle_video(message: Message, bot: Bot):
             if is_circle:
                 audio_bio = io.BytesIO(raw_bytes)
                 audio_bio.name = "circle.mp4"
-                transcript = await ai_client.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=audio_bio,
+                transcript = await asyncio.wait_for(
+                    ai_client.audio.transcriptions.create(
+                        model=WHISPER_MODEL,
+                        file=audio_bio,
+                    ),
+                    timeout=20.0,
                 )
                 recognized_speech = (getattr(transcript, "text", None) or "").strip()
                 if not recognized_speech:
@@ -2133,9 +2140,12 @@ async def handle_voice(message: Message, bot: Bot):
         try:
             audio_bio = io.BytesIO(raw_audio)
             audio_bio.name = f"voice{ext_from_tg}"
-            transcript = await ai_client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=audio_bio,
+            transcript = await asyncio.wait_for(
+                ai_client.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=audio_bio,
+                ),
+                timeout=20.0,
             )
             recognized_text = (getattr(transcript, "text", None) or "").strip()
         except Exception:
