@@ -211,6 +211,7 @@ router = Router()
 USER_INPUT_STATE: dict[int, str] = {}
 PROMO_DRAFT: dict[str, any] = {}
 BROADCAST_DRAFT: dict[str, int] = {}
+GLOBAL_DISCOUNT_DRAFT: dict[str, any] = {}
 MEDIA_GROUP_BUFFER: dict[str, list[Message]] = {}
 USER_QUOTA_LOCKS: dict[int, asyncio.Lock] = {}
 TX_FULFILL_LOCKS: dict[str, asyncio.Lock] = {}
@@ -228,38 +229,80 @@ def get_tx_lock(tx_id: str) -> asyncio.Lock:
     return TX_FULFILL_LOCKS[tx_id]
 
 
-# ================= РАСЧЁТ ЦЕН (ГОТОВЫХ И КАСТОМНЫХ) СО СКИДКОЙ 30% =================
+# ================= РАСЧЁТ ЦЕН (ГОТОВЫХ И КАСТОМНЫХ) СО СКИДКОЙ =================
+async def get_global_discount() -> dict:
+    """Возвращает {'active': bool, 'percent': int, 'until': float} для глобальной акции."""
+    raw_pct = await get_setting("global_discount_percent", "0")
+    raw_until = await get_setting("global_discount_until", "0")
+    try:
+        pct = int(raw_pct)
+    except Exception:
+        pct = 0
+    try:
+        until = float(raw_until)
+    except Exception:
+        until = 0.0
+
+    if pct > 0 and until > time.time():
+        return {"active": True, "percent": pct, "until": until}
+    return {"active": False, "percent": 0, "until": 0.0}
+
+
+async def get_effective_discount(user: dict) -> dict:
+    """Возвращает максимальную активную скидку пользователя (глобальную или персональную):
+    {'active': bool, 'percent': int, 'until': float, 'is_global': bool}."""
+    now = time.time()
+    pers_until = float(user.get("discount_until") or 0)
+    pers_active = pers_until > now
+    pers_pct = DISCOUNT_PERCENT if pers_active else 0
+
+    g_disc = await get_global_discount()
+    glob_active = g_disc["active"]
+    glob_pct = g_disc["percent"] if glob_active else 0
+    glob_until = g_disc["until"] if glob_active else 0.0
+
+    if not pers_active and not glob_active:
+        return {"active": False, "percent": 0, "until": 0.0, "is_global": False}
+
+    if glob_pct >= pers_pct and glob_active:
+        return {"active": True, "percent": glob_pct, "until": glob_until, "is_global": True}
+    return {"active": True, "percent": pers_pct, "until": pers_until, "is_global": False}
+
+
 def has_active_discount(user: dict) -> bool:
     return (user.get("discount_until") or 0) > time.time()
 
 
-def apply_discount_rub(base_rub: int, discount_active: bool) -> int:
+def apply_discount_rub(base_rub: int, discount_percent: int) -> int:
     # На суммы меньше 5 ₽ скидка не распространяется; минималка для рублёвых платежей — 3 ₽
     if base_rub < 5:
         return max(MIN_RUB_AMOUNT, base_rub)
-    if discount_active:
-        return max(MIN_RUB_AMOUNT, round(base_rub * (100 - DISCOUNT_PERCENT) / 100))
+    if discount_percent > 0:
+        return max(MIN_RUB_AMOUNT, round(base_rub * (100 - discount_percent) / 100))
     return max(MIN_RUB_AMOUNT, base_rub)
 
 
-def apply_discount_stars(base_stars: int, discount_active: bool) -> int:
+def apply_discount_stars(base_stars: int, discount_percent: int) -> int:
     if base_stars < 5:
         return max(1, base_stars)
-    if discount_active:
-        return max(1, round(base_stars * (100 - DISCOUNT_PERCENT) / 100))
+    if discount_percent > 0:
+        return max(1, round(base_stars * (100 - discount_percent) / 100))
     return max(1, base_stars)
 
 
-def get_product_price(product: dict, discount_active: bool) -> int:
-    return apply_discount_stars(product["stars"], discount_active)
+def get_product_price(product: dict, discount_percent: int | bool) -> int:
+    pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
+    return apply_discount_stars(product["stars"], pct)
 
 
-def get_product_rub_price(product: dict, discount_active: bool) -> int:
-    return apply_discount_rub(product["rub"], discount_active)
+def get_product_rub_price(product: dict, discount_percent: int | bool) -> int:
+    pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
+    return apply_discount_rub(product["rub"], pct)
 
 
-def calc_custom_sub_price(days: int, discount_active: bool) -> tuple[int, int]:
+def calc_custom_sub_price(days: int, discount_percent: int | bool) -> tuple[int, int]:
     """Возвращает (rub_price, stars_price) для кастомного срока подписки от 1 до 60 дней."""
+    pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
     if days == 1:
         base_rub, base_stars = 79, 59
     elif days == 7:
@@ -276,11 +319,12 @@ def calc_custom_sub_price(days: int, discount_active: bool) -> tuple[int, int]:
         base_rub = days * 15
         base_stars = days * 12
 
-    return apply_discount_rub(base_rub, discount_active), apply_discount_stars(base_stars, discount_active)
+    return apply_discount_rub(base_rub, pct), apply_discount_stars(base_stars, pct)
 
 
-def calc_custom_pack_price(reqs: int, discount_active: bool) -> tuple[int, int]:
+def calc_custom_pack_price(reqs: int, discount_percent: int | bool) -> tuple[int, int]:
     """Возвращает (rub_price, stars_price) для кастомного пакета от 1 до 500 запросов (1 запрос = 3 ₽ без скидки)."""
+    pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
     if reqs == 1:
         base_rub, base_stars = 3, 3
     elif reqs == 30:
@@ -299,10 +343,11 @@ def calc_custom_pack_price(reqs: int, discount_active: bool) -> tuple[int, int]:
         base_rub = round(reqs * 1.9)
         base_stars = round(reqs * 1.5)
 
-    return apply_discount_rub(base_rub, discount_active), apply_discount_stars(base_stars, discount_active)
+    return apply_discount_rub(base_rub, pct), apply_discount_stars(base_stars, pct)
 
 
-def resolve_order_details(order_code: str, discount_active: bool) -> dict | None:
+def resolve_order_details(order_code: str, discount_percent: int | bool) -> dict | None:
+    pct = (DISCOUNT_PERCENT if discount_percent else 0) if isinstance(discount_percent, bool) else int(discount_percent)
     if order_code.startswith("prod:"):
         prod_key = order_code.split(":", 1)[1]
         p = PRODUCTS.get(prod_key)
@@ -313,8 +358,8 @@ def resolve_order_details(order_code: str, discount_active: bool) -> dict | None
             "type": p["type"],
             "title": p["title"],
             "value": p["value"],
-            "rub": get_product_rub_price(p, discount_active),
-            "stars": get_product_price(p, discount_active),
+            "rub": get_product_rub_price(p, pct),
+            "stars": get_product_price(p, pct),
             "back_cb": "shop:subs" if p["type"] == "sub" else "shop:packs",
         }
     elif order_code.startswith("csub:"):
@@ -324,7 +369,7 @@ def resolve_order_details(order_code: str, discount_active: bool) -> dict | None
         days = int(val_s)
         if not (1 <= days <= MAX_CUSTOM_SUB_DAYS):
             return None
-        rub_p, stars_p = calc_custom_sub_price(days, discount_active)
+        rub_p, stars_p = calc_custom_sub_price(days, pct)
         return {
             "order_code": order_code,
             "type": "sub",
@@ -341,7 +386,7 @@ def resolve_order_details(order_code: str, discount_active: bool) -> dict | None
         reqs = int(val_s)
         if not (MIN_CUSTOM_PACK_REQS <= reqs <= MAX_CUSTOM_PACK_REQS):
             return None
-        rub_p, stars_p = calc_custom_pack_price(reqs, discount_active)
+        rub_p, stars_p = calc_custom_pack_price(reqs, pct)
         return {
             "order_code": order_code,
             "type": "pack",
@@ -1147,12 +1192,13 @@ def shop_main_kb() -> InlineKeyboardMarkup:
     )
 
 
-def render_shop_main_text(user: dict) -> str:
-    disc = has_active_discount(user)
+async def render_shop_main_text(user: dict) -> str:
+    disc_info = await get_effective_discount(user)
     disc_line = ""
-    if disc:
-        exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        disc_line = f"🔥 <b>АКТИВНА ПЕРСОНАЛЬНАЯ СКИДКА {DISCOUNT_PERCENT}% (до {exp})!</b>\n\n"
+    if disc_info["active"]:
+        exp = datetime.fromtimestamp(disc_info["until"]).strftime("%d.%m %H:%M")
+        label = "ГЛОБАЛЬНАЯ СКИДКА" if disc_info["is_global"] else "ПЕРСОНАЛЬНАЯ СКИДКА"
+        disc_line = f"🔥 <b>АКТИВНА {label} {disc_info['percent']}% (до {exp})!</b>\n\n"
 
     return (
         f"⭐ <b>Магазин подписок и пакетов</b>\n\n"
@@ -1163,13 +1209,13 @@ def render_shop_main_text(user: dict) -> str:
     )
 
 
-def shop_subs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
+def shop_subs_kb(discount_percent: int = 0) -> InlineKeyboardMarkup:
     buttons = []
     for key in ("sub_trial", "sub_standard", "sub_premium"):
         p = PRODUCTS[key]
-        sp = get_product_price(p, discount_active)
-        rp = get_product_rub_price(p, discount_active)
-        prefix = "🔥" if discount_active else "👑"
+        sp = get_product_price(p, discount_percent)
+        rp = get_product_rub_price(p, discount_percent)
+        prefix = "🔥" if discount_percent > 0 else "👑"
         buttons.append([
             InlineKeyboardButton(
                 text=f"{prefix} {p['title']} — {rp} ₽ / {sp} ⭐",
@@ -1182,18 +1228,20 @@ def shop_subs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def render_shop_subs_text(user: dict) -> str:
-    disc = has_active_discount(user)
+async def render_shop_subs_text(user: dict) -> str:
+    disc_info = await get_effective_discount(user)
+    pct = disc_info["percent"]
     lines = ["👑 <b>Подписки (безлимит на все PRO-модели)</b>\n"]
-    if disc:
-        exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        lines.append(f"🔥 <b>Скидка {DISCOUNT_PERCENT}% активна до {exp}!</b>\n")
+    if disc_info["active"]:
+        exp = datetime.fromtimestamp(disc_info["until"]).strftime("%d.%m %H:%M")
+        label = "Глобальная скидка" if disc_info["is_global"] else "Персональная скидка"
+        lines.append(f"🔥 <b>{label} {pct}% активна до {exp}!</b>\n")
 
     for key in ("sub_trial", "sub_standard", "sub_premium"):
         p = PRODUCTS[key]
-        sp = get_product_price(p, disc)
-        rp = get_product_rub_price(p, disc)
-        if disc:
+        sp = get_product_price(p, pct)
+        rp = get_product_rub_price(p, pct)
+        if pct > 0:
             lines.append(f"• {p['title']}: <s>{p['rub']} ₽</s> → <b>{rp} ₽</b> ({sp} ⭐)")
         else:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
@@ -1202,13 +1250,13 @@ def render_shop_subs_text(user: dict) -> str:
     return "\n".join(lines)
 
 
-def shop_packs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
+def shop_packs_kb(discount_percent: int = 0) -> InlineKeyboardMarkup:
     buttons = []
     for key in ("pack_30", "pack_100", "pack_300"):
         p = PRODUCTS[key]
-        sp = get_product_price(p, discount_active)
-        rp = get_product_rub_price(p, discount_active)
-        prefix = "🔥" if discount_active else "⚡"
+        sp = get_product_price(p, discount_percent)
+        rp = get_product_rub_price(p, discount_percent)
+        prefix = "🔥" if discount_percent > 0 else "⚡"
         buttons.append([
             InlineKeyboardButton(
                 text=f"{prefix} {p['title']} — {rp} ₽ / {sp} ⭐",
@@ -1226,18 +1274,20 @@ def shop_packs_kb(discount_active: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def render_shop_packs_text(user: dict) -> str:
-    disc = has_active_discount(user)
+async def render_shop_packs_text(user: dict) -> str:
+    disc_info = await get_effective_discount(user)
+    pct = disc_info["percent"]
     lines = ["⚡ <b>Пакеты запросов (расходуются после дневного лимита)</b>\n"]
-    if disc:
-        exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        lines.append(f"🔥 <b>Скидка {DISCOUNT_PERCENT}% активна до {exp}!</b>\n")
+    if disc_info["active"]:
+        exp = datetime.fromtimestamp(disc_info["until"]).strftime("%d.%m %H:%M")
+        label = "Глобальная скидка" if disc_info["is_global"] else "Персональная скидка"
+        lines.append(f"🔥 <b>{label} {pct}% активна до {exp}!</b>\n")
 
     for key in ("pack_30", "pack_100", "pack_300"):
         p = PRODUCTS[key]
-        sp = get_product_price(p, disc)
-        rp = get_product_rub_price(p, disc)
-        if disc:
+        sp = get_product_price(p, pct)
+        rp = get_product_rub_price(p, pct)
+        if pct > 0:
             lines.append(f"• {p['title']}: <s>{p['rub']} ₽</s> → <b>{rp} ₽</b> ({sp} ⭐)")
         else:
             lines.append(f"• {p['title']} — <b>{rp} ₽</b> / <b>{sp} ⭐</b>")
@@ -1262,15 +1312,23 @@ def profile_kb() -> InlineKeyboardMarkup:
 
 async def admin_kb() -> InlineKeyboardMarkup:
     engine = await get_engine_model()
+    g_disc = await get_global_discount()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'") as cur:
             pending_w = (await cur.fetchone())[0]
 
     w_label = f"💸 Заявки на вывод ({pending_w} шт.)" if pending_w > 0 else "💸 Заявки на вывод (0)"
+    if g_disc["active"]:
+        exp_str = datetime.fromtimestamp(g_disc["until"]).strftime("%d.%m %H:%M")
+        g_disc_label = f"🔥 Глобальная скидка: -{g_disc['percent']}% (до {exp_str})"
+    else:
+        g_disc_label = "🔥 Глобальная скидка (настроить)"
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи (просмотр / выдача / снятие)", callback_data="adm_users:0")],
             [InlineKeyboardButton(text=w_label, callback_data="adm_withdrawals")],
+            [InlineKeyboardButton(text=g_disc_label, callback_data="adm_gdisc_menu")],
             [InlineKeyboardButton(text="📢 Рассылка всем пользователям", callback_data="adm_broadcast")],
             [InlineKeyboardButton(text=f"⚙️ Общий движок (текст и фото): {engine}", callback_data="adm_set_engine")],
             [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo_create")],
@@ -1333,7 +1391,7 @@ async def cb_shop(call: CallbackQuery, bot: Bot):
         return
     user = await get_user(call.from_user.id, full_name=call.from_user.full_name, username=call.from_user.username or "")
     try:
-        await call.message.edit_text(render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
+        await call.message.edit_text(await render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
         pass
     await call.answer()
@@ -1346,9 +1404,13 @@ async def cb_shop_subs(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
+    disc_info = await get_effective_discount(user)
     try:
-        await call.message.edit_text(render_shop_subs_text(user), reply_markup=shop_subs_kb(disc), parse_mode=ParseMode.HTML)
+        await call.message.edit_text(
+            await render_shop_subs_text(user),
+            reply_markup=shop_subs_kb(disc_info["percent"]),
+            parse_mode=ParseMode.HTML,
+        )
     except TelegramBadRequest:
         pass
     await call.answer()
@@ -1361,9 +1423,13 @@ async def cb_shop_packs(call: CallbackQuery, bot: Bot):
         await call.answer()
         return
     user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
+    disc_info = await get_effective_discount(user)
     try:
-        await call.message.edit_text(render_shop_packs_text(user), reply_markup=shop_packs_kb(disc), parse_mode=ParseMode.HTML)
+        await call.message.edit_text(
+            await render_shop_packs_text(user),
+            reply_markup=shop_packs_kb(disc_info["percent"]),
+            parse_mode=ParseMode.HTML,
+        )
     except TelegramBadRequest:
         pass
     await call.answer()
@@ -1399,8 +1465,8 @@ async def cb_custom_pack_enter(call: CallbackQuery):
 
 async def send_payment_method_choice(target_msg: Message, user_id: int, order_code: str, edit: bool = True):
     user = await get_user(user_id)
-    disc = has_active_discount(user)
-    order = resolve_order_details(order_code, disc)
+    disc_info = await get_effective_discount(user)
+    order = resolve_order_details(order_code, disc_info["percent"])
     if not order:
         if edit:
             await target_msg.edit_text("⚠️ Товар не найден.", reply_markup=shop_main_kb())
@@ -1448,8 +1514,8 @@ async def cb_choose_pay(call: CallbackQuery):
 async def cb_pay_sbp(call: CallbackQuery):
     order_code = call.data.split(":", 1)[1]
     user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    order = resolve_order_details(order_code, disc)
+    disc_info = await get_effective_discount(user)
+    order = resolve_order_details(order_code, disc_info["percent"])
     if not order:
         await call.answer("Товар не найден", show_alert=True)
         return
@@ -1554,8 +1620,9 @@ async def cb_chk_sbp(call: CallbackQuery, bot: Bot):
 async def cb_pay_stars(call: CallbackQuery):
     order_code = call.data.split(":", 1)[1]
     user = await get_user(call.from_user.id)
-    disc = has_active_discount(user)
-    order = resolve_order_details(order_code, disc)
+    disc_info = await get_effective_discount(user)
+    pct = disc_info["percent"]
+    order = resolve_order_details(order_code, pct)
     if not order:
         await call.answer("Товар не найден", show_alert=True)
         return
@@ -1566,7 +1633,7 @@ async def cb_pay_stars(call: CallbackQuery):
         desc = f"Пакет на {order['value']} дополнительных запросов."
 
     await call.message.answer_invoice(
-        title=order["title"] + (f" (Скидка {DISCOUNT_PERCENT}%)" if (disc and order["stars"] >= 5) else ""),
+        title=order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else ""),
         description=desc,
         payload=f"ord:{order_code}",
         currency="XTR",
@@ -1585,7 +1652,7 @@ async def successful_payment(message: Message, bot: Bot):
     payload = message.successful_payment.invoice_payload
     paid_stars = message.successful_payment.total_amount
     user = await get_user(message.from_user.id)
-    disc = has_active_discount(user)
+    disc_info = await get_effective_discount(user)
 
     if payload.startswith("ord:"):
         order_code = payload.split(":", 1)[1]
@@ -1594,7 +1661,7 @@ async def successful_payment(message: Message, bot: Bot):
     else:
         order_code = payload
 
-    order = resolve_order_details(order_code, disc)
+    order = resolve_order_details(order_code, disc_info["percent"])
     if not order:
         order = {
             "order_code": order_code,
@@ -2661,9 +2728,11 @@ async def render_profile_text(user_id: int, first_name: str) -> str:
         )
 
     disc_line = ""
-    if has_active_discount(user):
-        d_exp = datetime.fromtimestamp(user["discount_until"]).strftime("%d.%m %H:%M")
-        disc_line = f"\n🔥 Персональная скидка {DISCOUNT_PERCENT}%: <b>Активна до {d_exp}</b>"
+    disc_info = await get_effective_discount(user)
+    if disc_info["active"]:
+        d_exp = datetime.fromtimestamp(disc_info["until"]).strftime("%d.%m %H:%M")
+        d_label = "Глобальная скидка" if disc_info["is_global"] else "Персональная скидка"
+        disc_line = f"\n🔥 {d_label} {disc_info['percent']}%: <b>Активна до {d_exp}</b>"
 
     return (
         f"👤 <b>Профиль — {html.escape(first_name)}</b>\n\n"
@@ -2761,6 +2830,7 @@ async def redeem_promocode(user_id: int, raw_code: str) -> tuple[bool, str]:
 async def render_admin_text() -> str:
     today_str = str(date.today())
     engine = await get_engine_model()
+    g_disc = await get_global_discount()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             total_users = (await cur.fetchone())[0]
@@ -2778,10 +2848,16 @@ async def render_admin_text() -> str:
             pending_w = (await cur.fetchone())[0]
 
     platega_status = "🟢 Подключена" if (PLATEGA_MERCHANT_ID and PLATEGA_SECRET) else "🔴 Не заданы ключи"
+    if g_disc["active"]:
+        g_exp = datetime.fromtimestamp(g_disc["until"]).strftime("%d.%m.%Y %H:%M")
+        g_disc_status = f"🔥 <b>-{g_disc['percent']}%</b> (до {g_exp})"
+    else:
+        g_disc_status = "⚪ Выключена"
 
     return (
         "🛠 <b>Админ-панель управления</b>\n\n"
         f"💳 Platega СБП: <b>{platega_status}</b>\n"
+        f"🔥 Глобальная скидка: {g_disc_status}\n"
         f"⚙️ Общий движок (текст и фото): <code>{engine}</code>\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 Активных подписок: <b>{pro_users}</b>\n"
@@ -2813,6 +2889,261 @@ async def cb_admin_panel(call: CallbackQuery):
     except TelegramBadRequest:
         pass
     await call.answer()
+
+
+# ================= АДМИН: ГЛОБАЛЬНАЯ СКИДКА ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ =================
+def format_duration_ru(seconds: int) -> str:
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    parts = []
+    if days > 0:
+        parts.append(f"{days} дн.")
+    if hours > 0:
+        parts.append(f"{hours} ч.")
+    return " ".join(parts) if parts else f"{max(1, seconds // 60)} мин."
+
+
+def parse_duration_to_seconds(raw: str) -> int | None:
+    """Парсит срок вида '3д', '12ч', '2д 6ч', '48' (часов по умолчанию) в секунды."""
+    s = raw.strip().lower()
+    if not s:
+        return None
+    if s.isdigit():
+        hrs = int(s)
+        return hrs * 3600 if hrs > 0 else None
+
+    total_sec = 0
+    matched = False
+    for num_s, unit in re.findall(r"(\d+)\s*([дdчhмm]?)", s):
+        val = int(num_s)
+        if val <= 0:
+            continue
+        matched = True
+        if unit in ("д", "d"):
+            total_sec += val * 86400
+        elif unit in ("м", "m"):
+            total_sec += val * 60
+        else:
+            total_sec += val * 3600
+    return total_sec if (matched and total_sec > 0) else None
+
+
+async def render_gdisc_menu() -> tuple[str, InlineKeyboardMarkup]:
+    g_disc = await get_global_discount()
+    buttons = []
+    if g_disc["active"]:
+        exp_str = datetime.fromtimestamp(g_disc["until"]).strftime("%d.%m.%Y %H:%M")
+        rem_sec = max(0, int(g_disc["until"] - time.time()))
+        status_block = (
+            f"🟢 <b>Сейчас активна глобальная скидка: -{g_disc['percent']}%</b>\n"
+            f"⏳ Действует до: <b>{exp_str}</b> (осталось {format_duration_ru(rem_sec)})\n\n"
+        )
+        buttons.append([InlineKeyboardButton(text="🛑 Выключить глобальную скидку", callback_data="adm_gdisc_off")])
+    else:
+        status_block = "⚪ <b>Сейчас глобальная скидка выключена.</b>\n\n"
+
+    buttons.append([InlineKeyboardButton(text="🔥 Запустить / изменить глобальную скидку", callback_data="adm_gdisc_start")])
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+
+    text = (
+        "🔥 <b>Управление глобальной скидкой</b>\n\n"
+        f"{status_block}"
+        "Глобальная скидка действует <b>сразу для всех пользователей бота</b> на все подписки и пакеты запросов (от 5 ₽)."
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "adm_gdisc_menu")
+async def cb_adm_gdisc_menu(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    text, kb = await render_gdisc_menu()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_gdisc_off")
+async def cb_adm_gdisc_off(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await set_setting("global_discount_percent", "0")
+    await set_setting("global_discount_until", "0")
+    await call.answer("🛑 Глобальная скидка выключена!", show_alert=True)
+    text, kb = await render_gdisc_menu()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "adm_gdisc_start")
+async def cb_adm_gdisc_start(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    GLOBAL_DISCOUNT_DRAFT.clear()
+    USER_INPUT_STATE[ADMIN_ID] = "adm_gdisc_pct"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="15%", callback_data="adm_gdisc_pct:15"),
+                InlineKeyboardButton(text="20%", callback_data="adm_gdisc_pct:20"),
+                InlineKeyboardButton(text="30%", callback_data="adm_gdisc_pct:30"),
+            ],
+            [
+                InlineKeyboardButton(text="40%", callback_data="adm_gdisc_pct:40"),
+                InlineKeyboardButton(text="50%", callback_data="adm_gdisc_pct:50"),
+                InlineKeyboardButton(text="70%", callback_data="adm_gdisc_pct:70"),
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_gdisc_menu")],
+        ]
+    )
+    await call.message.edit_text(
+        "🔥 <b>Глобальная скидка — Шаг 1/2 (Процент)</b>\n\n"
+        "Выбери процент скидки кнопкой ниже или <b>введи своё число от 1 до 95</b> (например: <code>25</code>):",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+    await call.answer()
+
+
+async def show_gdisc_step2_duration(target_msg: Message, edit: bool = True):
+    pct = GLOBAL_DISCOUNT_DRAFT.get("percent", 20)
+    USER_INPUT_STATE[ADMIN_ID] = "adm_gdisc_dur"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="6 часов", callback_data="adm_gdisc_dur:21600"),
+                InlineKeyboardButton(text="12 часов", callback_data="adm_gdisc_dur:43200"),
+                InlineKeyboardButton(text="24 часа (1 дн.)", callback_data="adm_gdisc_dur:86400"),
+            ],
+            [
+                InlineKeyboardButton(text="2 дня (48 ч.)", callback_data="adm_gdisc_dur:172800"),
+                InlineKeyboardButton(text="3 дня (72 ч.)", callback_data="adm_gdisc_dur:259200"),
+                InlineKeyboardButton(text="7 дней", callback_data="adm_gdisc_dur:604800"),
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm_gdisc_menu")],
+        ]
+    )
+    text = (
+        f"⏳ <b>Глобальная скидка {pct}% — Шаг 2/2 (Срок действия)</b>\n\n"
+        "Выбери длительность акции кнопкой ниже или <b>введи свой срок текстом</b>:\n"
+        "• <code>12ч</code> — на 12 часов\n"
+        "• <code>3д</code> — на 3 дня\n"
+        "• <code>2д 12ч</code> — на 2 дня и 12 часов"
+    )
+    if edit:
+        await target_msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await target_msg.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_gdisc_pct:"))
+async def cb_adm_gdisc_pct(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    pct = int(call.data.split(":", 1)[1])
+    GLOBAL_DISCOUNT_DRAFT["percent"] = pct
+    await show_gdisc_step2_duration(call.message, edit=True)
+    await call.answer()
+
+
+async def activate_global_discount_and_ask_notify(duration_sec: int, target_msg: Message, edit: bool = True):
+    USER_INPUT_STATE.pop(ADMIN_ID, None)
+    pct = int(GLOBAL_DISCOUNT_DRAFT.get("percent", 20))
+    until_ts = time.time() + duration_sec
+    GLOBAL_DISCOUNT_DRAFT["duration_sec"] = duration_sec
+    GLOBAL_DISCOUNT_DRAFT["until"] = until_ts
+
+    await set_setting("global_discount_percent", str(pct))
+    await set_setting("global_discount_until", str(until_ts))
+
+    exp_str = datetime.fromtimestamp(until_ts).strftime("%d.%m.%Y %H:%M")
+    dur_str = format_duration_ru(duration_sec)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Уведомить всех пользователей об акции", callback_data="adm_gdisc_notify")],
+            [InlineKeyboardButton(text="✅ Готово (без рассылки)", callback_data="adm_gdisc_menu")],
+        ]
+    )
+    text = (
+        f"✅ <b>Глобальная скидка {pct}% успешно запущена!</b>\n\n"
+        f"⏳ Длительность: <b>{dur_str}</b> (до <b>{exp_str}</b>)\n"
+        f"💰 Новые цены уже применяются в магазине для всех пользователей.\n\n"
+        f"Отправить уведомление о старте скидки всем пользователям в личку?"
+    )
+    if edit:
+        await target_msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await target_msg.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("adm_gdisc_dur:"))
+async def cb_adm_gdisc_dur(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    dur_sec = int(call.data.split(":", 1)[1])
+    await activate_global_discount_and_ask_notify(dur_sec, call.message, edit=True)
+    await call.answer()
+
+
+@router.callback_query(F.data == "adm_gdisc_notify")
+async def cb_adm_gdisc_notify(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != ADMIN_ID:
+        return
+    g_disc = await get_global_discount()
+    if not g_disc["active"]:
+        await call.answer("⚠️ Глобальная скидка уже не активна.", show_alert=True)
+        return
+
+    pct = g_disc["percent"]
+    until_ts = g_disc["until"]
+    exp_str = datetime.fromtimestamp(until_ts).strftime("%d.%m.%Y %H:%M")
+    rem_str = format_duration_ru(max(60, int(until_ts - time.time())))
+
+    promo_text = (
+        f"🔥 <b>ГЛОБАЛЬНАЯ СКИДКА {pct}% ДЛЯ ВСЕХ УЖЕ ДЕЙСТВУЕТ!</b>\n\n"
+        f"Снизили цены на <b>{pct}%</b> на все подписки и пакеты запросов (от 5 ₽) на <b>{rem_str}</b> (до <b>{exp_str}</b>):\n\n"
+        "👑 <b>Подписки (безлимит на все PRO-модели):</b>\n"
+        f"• Пробный 1 день: <s>79 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_trial'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_trial'], pct)} ⭐)\n"
+        f"• Стандарт 7 дней: <s>199 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_standard'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_standard'], pct)} ⭐)\n"
+        f"• Премиум 30 дней: <s>449 ₽</s> → <b>{get_product_rub_price(PRODUCTS['sub_premium'], pct)} ₽</b> ({get_product_price(PRODUCTS['sub_premium'], pct)} ⭐)\n\n"
+        "⚡ <b>Пакеты запросов (не сгорают):</b>\n"
+        f"• +30 запросов: <s>99 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_30'], pct)} ₽</b> ({get_product_price(PRODUCTS['pack_30'], pct)} ⭐)\n"
+        f"• +100 запросов: <s>259 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_100'], pct)} ₽</b> ({get_product_price(PRODUCTS['pack_100'], pct)} ⭐)\n"
+        f"• +300 запросов: <s>589 ₽</s> → <b>{get_product_rub_price(PRODUCTS['pack_300'], pct)} ₽</b> ({get_product_price(PRODUCTS['pack_300'], pct)} ⭐)\n\n"
+        "👇 Переходи в магазин прямо сейчас, пока действует акция:"
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            rows = await cur.fetchall()
+
+    user_ids = [r[0] for r in rows]
+    await call.message.edit_text(f"⏳ <b>Рассылаю уведомление о скидке {pct}% ({len(user_ids)} чел.)...</b>", parse_mode=ParseMode.HTML)
+    await call.answer()
+
+    sent_ok = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, promo_text, reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
+            sent_ok += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await call.message.answer(
+        f"✅ <b>Рассылка об акции завершена!</b>\n\n"
+        f"📨 Доставлено: <b>{sent_ok}</b>\n"
+        f"🚫 Не доставлено: <b>{failed}</b>",
+        reply_markup=await admin_kb(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.callback_query(F.data == "adm_promo_create")
@@ -3163,7 +3494,7 @@ async def cmd_shop(message: Message, bot: Bot):
     user = await get_user(message.from_user.id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, message.from_user.id, message):
         return
-    await message.answer(render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(await render_shop_main_text(user), reply_markup=shop_main_kb(), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("clear"))
@@ -3691,6 +4022,33 @@ async def handle_prompt(message: Message, bot: Bot):
                 await message.answer("⚠️ Код должен быть одним словом без пробелов (минимум 2 символа):", reply_markup=admin_cancel_kb())
                 return
             await save_promo_and_reply(text_in, message, edit=False)
+            return
+
+        elif action == "adm_gdisc_pct":
+            clean_pct = text_in.rstrip("%").strip()
+            if not clean_pct.isdigit() or not (1 <= int(clean_pct) <= 95):
+                USER_INPUT_STATE[ADMIN_ID] = "adm_gdisc_pct"
+                await message.answer(
+                    "⚠️ Введи целое число процентов от <b>1 до 95</b> (например: <code>25</code>):",
+                    reply_markup=admin_cancel_kb("adm_gdisc_menu"),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            GLOBAL_DISCOUNT_DRAFT["percent"] = int(clean_pct)
+            await show_gdisc_step2_duration(message, edit=False)
+            return
+
+        elif action == "adm_gdisc_dur":
+            dur_sec = parse_duration_to_seconds(text_in)
+            if not dur_sec or dur_sec > 365 * 86400:
+                USER_INPUT_STATE[ADMIN_ID] = "adm_gdisc_dur"
+                await message.answer(
+                    "⚠️ Неверный формат срока. Введи число часов (например <code>12</code>) или формат <code>3д</code> / <code>2д 6ч</code>:",
+                    reply_markup=admin_cancel_kb("adm_gdisc_menu"),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await activate_global_discount_and_ask_notify(dur_sec, message, edit=False)
             return
 
         elif action == "set_engine":
