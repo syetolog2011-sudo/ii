@@ -1973,7 +1973,7 @@ async def generate_video_response(
     raise last_error or RuntimeError("Выбранная модель временно не смогла обработать видео")
 
 
-@router.message(F.video)
+@router.message(F.video | F.video_note)
 async def handle_video(message: Message, bot: Bot):
     user_id = message.from_user.id
     user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
@@ -1984,8 +1984,9 @@ async def handle_video(message: Message, bot: Bot):
         await message.answer("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
         return
 
-    video = message.video
-    if video.file_size and video.file_size > 20 * 1024 * 1024:
+    is_circle = bool(message.video_note)
+    media_obj = message.video_note if is_circle else message.video
+    if media_obj.file_size and media_obj.file_size > 20 * 1024 * 1024:
         await message.answer("⚠️ Видео слишком тяжёлое (лимит Telegram для ботов — до 20 МБ). Сожми видео или обрежь его.")
         return
 
@@ -2009,24 +2010,60 @@ async def handle_video(message: Message, bot: Bot):
         return
 
     shown_model = ALL_MODELS_MAP.get(model_id, {}).get("name", model_id)
-    wait_msg = await message.answer(f"🎬 <i>Анализирую видео ({shown_model})...</i>", parse_mode=ParseMode.HTML)
+    media_label = "кружочек" if is_circle else "видео"
+    wait_msg = await message.answer(f"🎬 <i>Анализирую {media_label} ({shown_model})...</i>", parse_mode=ParseMode.HTML)
 
     try:
-        file_info = await bot.get_file(video.file_id)
+        file_info = await bot.get_file(media_obj.file_id)
         downloaded = await bot.download_file(file_info.file_path)
-        b64_video = base64.b64encode(downloaded.read()).decode("utf-8")
-        mime_type = video.mime_type or "video/mp4"
-        caption = (message.caption or "").strip() or "Подробно разбери, что происходит на этом видео, и ответь на задание или вопрос."
+        raw_bytes = downloaded.read()
+        b64_video = base64.b64encode(raw_bytes).decode("utf-8")
+        mime_type = getattr(media_obj, "mime_type", None) or "video/mp4"
 
-        answer_text = await generate_video_response(
-            user_id=user_id,
-            selected_model=model_id,
-            caption=caption,
-            b64_video=b64_video,
-            mime_type=mime_type,
-        )
+        if is_circle:
+            caption = (
+                "Это видеосообщение (кружочек) из Telegram. Внимательно разбери, что говорит и показывает пользователь "
+                "в кружочке, и дай понятный, полезный ответ по существу."
+            )
+        else:
+            caption = (message.caption or "").strip() or "Подробно разбери, что происходит на этом видео, и ответь на задание или вопрос."
 
-        await add_history(user_id, "user", f"[Отправил видео с подписью: {caption}]")
+        answer_text = None
+        try:
+            answer_text = await generate_video_response(
+                user_id=user_id,
+                selected_model=model_id,
+                caption=caption,
+                b64_video=b64_video,
+                mime_type=mime_type,
+            )
+        except Exception:
+            if is_circle:
+                audio_bio = io.BytesIO(raw_bytes)
+                audio_bio.name = "circle.mp4"
+                transcript = await ai_client.audio.transcriptions.create(
+                    model=WHISPER_MODEL,
+                    file=audio_bio,
+                )
+                recognized_speech = (getattr(transcript, "text", None) or "").strip()
+                if not recognized_speech:
+                    raise
+                if is_content_forbidden(recognized_speech):
+                    await refund_quota(user_id, quota_receipt)
+                    await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+                    return
+                history = await get_history(user_id)
+                answer_text = await generate_text_response(
+                    user_id=user_id,
+                    selected_model=model_id,
+                    history=history,
+                    user_text=recognized_speech,
+                )
+            else:
+                raise
+
+        hist_label = "[Отправил кружочек]" if is_circle else f"[Отправил видео с подписью: {caption}]"
+        await add_history(user_id, "user", hist_label)
         await add_history(user_id, "assistant", answer_text)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -2042,17 +2079,26 @@ async def handle_video(message: Message, bot: Bot):
     except Exception as e:
         await refund_quota(user_id, quota_receipt)
         await wait_msg.edit_text(
-            f"⚠️ <b>Не удалось обработать видео:</b>\n<code>{str(e)[:250]}</code>",
+            f"⚠️ <b>Не удалось обработать {media_label}:</b>\n<code>{str(e)[:250]}</code>",
             parse_mode=ParseMode.HTML,
         )
 
 
-# ================= ГОЛОСОВЫЕ СООБЩЕНИЯ (AUDIO -> WHISPER -> НЕЙРОСЕТЬ) =================
-@router.message(F.voice)
+# ================= ГОЛОСОВЫЕ И АУДИО СООБЩЕНИЯ (VOICE / AUDIO -> WHISPER / LLM) =================
+@router.message(F.voice | F.audio)
 async def handle_voice(message: Message, bot: Bot):
     user_id = message.from_user.id
     user = await get_user(user_id, full_name=message.from_user.full_name, username=message.from_user.username or "")
     if not await ensure_subscribed(bot, user_id, message):
+        return
+
+    if is_content_forbidden(message.caption or ""):
+        await message.answer("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+        return
+
+    voice_obj = message.voice or message.audio
+    if voice_obj.file_size and voice_obj.file_size > 20 * 1024 * 1024:
+        await message.answer("⚠️ Аудиофайл слишком тяжёлый (лимит Telegram для ботов — до 20 МБ).")
         return
 
     model_id = user["selected_model"]
@@ -2075,42 +2121,73 @@ async def handle_voice(message: Message, bot: Bot):
 
     wait_msg = await message.answer("🎙 <i>Слушаю голосовое и готовлю ответ...</i>", parse_mode=ParseMode.HTML)
     try:
-        file_info = await bot.get_file(message.voice.file_id)
+        file_info = await bot.get_file(voice_obj.file_id)
         downloaded = await bot.download_file(file_info.file_path)
-        audio_bio = io.BytesIO(downloaded.read())
-        audio_bio.name = "voice.ogg"
+        raw_audio = downloaded.read()
 
-        transcript = await ai_client.audio.transcriptions.create(
-            model=WHISPER_MODEL,
-            file=audio_bio,
-        )
-        recognized_text = (getattr(transcript, "text", None) or "").strip()
-        if not recognized_text:
-            raise RuntimeError("Не удалось разобрать слова в голосовом сообщении")
+        ext_from_tg = os.path.splitext(file_info.file_path or "")[1].lower()
+        if not ext_from_tg:
+            ext_from_tg = ".ogg" if message.voice else ".mp3"
 
-        if is_content_forbidden(recognized_text):
-            await refund_quota(user_id, quota_receipt)
-            await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
-            return
+        recognized_text = ""
+        try:
+            audio_bio = io.BytesIO(raw_audio)
+            audio_bio.name = f"voice{ext_from_tg}"
+            transcript = await ai_client.audio.transcriptions.create(
+                model=WHISPER_MODEL,
+                file=audio_bio,
+            )
+            recognized_text = (getattr(transcript, "text", None) or "").strip()
+        except Exception:
+            recognized_text = ""
 
+        extra_caption = (message.caption or "").strip()
         history = await get_history(user_id)
-        answer_text = await generate_text_response(
-            user_id=user_id,
-            selected_model=model_id,
-            history=history,
-            user_text=recognized_text,
-        )
 
-        await add_history(user_id, "user", recognized_text)
-        await add_history(user_id, "assistant", answer_text)
+        if recognized_text:
+            full_user_prompt = f"{extra_caption}\n\n{recognized_text}".strip() if extra_caption else recognized_text
+            if is_content_forbidden(full_user_prompt):
+                await refund_quota(user_id, quota_receipt)
+                await wait_msg.edit_text("🚫 Запрос отклонён системой безопасности: запрещённый контент.")
+                return
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
-            await db.commit()
+            answer_text = await generate_text_response(
+                user_id=user_id,
+                selected_model=model_id,
+                history=history,
+                user_text=full_user_prompt,
+            )
+            await add_history(user_id, "user", full_user_prompt)
+            await add_history(user_id, "assistant", answer_text)
 
-        await wait_msg.delete()
-        full_reply = f"🗣 Вы сказали: {recognized_text}\n\n{answer_text}"
-        await send_formatted_answer(message, full_reply)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+                await db.commit()
+
+            await wait_msg.delete()
+            full_reply = f"🗣 Вы сказали: {recognized_text}\n\n{answer_text}"
+            await send_formatted_answer(message, full_reply)
+        else:
+            # Резерв: если Whisper недоступен на шлюзе, отправляем аудио напрямую в мультимодальную модель (Gemini)
+            mime_audio = getattr(voice_obj, "mime_type", None) or ("audio/ogg" if message.voice else "audio/mpeg")
+            b64_audio = base64.b64encode(raw_audio).decode("utf-8")
+            audio_prompt = extra_caption or "Внимательно прослушай это голосовое сообщение, кратко передай суть сказанного и дай подробный ответ."
+            answer_text = await generate_video_response(
+                user_id=user_id,
+                selected_model=model_id,
+                caption=audio_prompt,
+                b64_video=b64_audio,
+                mime_type=mime_audio,
+            )
+            await add_history(user_id, "user", f"[Голосовое сообщение]{': ' + extra_caption if extra_caption else ''}")
+            await add_history(user_id, "assistant", answer_text)
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+                await db.commit()
+
+            await wait_msg.delete()
+            await send_formatted_answer(message, answer_text)
 
     except Exception as e:
         await refund_quota(user_id, quota_receipt)
@@ -3465,7 +3542,7 @@ async def cmd_start(message: Message, bot: Bot):
         f"Я — твой универсальный ИИ-помощник. Вот что я умею:\n"
         f"💬 Отвечать на любые вопросы и писать код\n"
         f"📸 Решать задачи и разбирать конспекты по фото (до {MAX_ALBUM_PHOTOS} шт. за раз)\n"
-        f"🎬 Анализировать видеоролики, голосовые и файлы\n\n"
+        f"🎬 Анализировать видео, кружочки, голосовые и файлы\n\n"
         f"📊 Статус: <b>{format_status(user)}</b>\n"
         f"🤖 Активная модель: <b>{cur_model_name}</b>"
     )
