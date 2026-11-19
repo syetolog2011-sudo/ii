@@ -1218,8 +1218,13 @@ def models_in_category_kb(cat_key: str, current_model: str, pro_active: bool) ->
     buttons = []
     for m in cat["models"]:
         check = "✅ " if m["id"] == current_model else ""
-        lock = "🔒 " if (m["pro"] and not pro_active) else ""
-        btn_text = f"{check}{lock}{m['name']} [{m['tag']}]"
+        if pro_active:
+            status_tag = " [РАЗБЛОКИРОВАНО]" if m["pro"] else " [FREE]"
+            lock = "🔓 " if (m["pro"] and m["id"] != current_model) else ""
+        else:
+            status_tag = f" [{m['tag']}]"
+            lock = "🔒 " if m["pro"] else ""
+        btn_text = f"{check}{lock}{m['name']}{status_tag}"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"set_model:{cat_key}:{m['id']}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_cats")])
@@ -4951,28 +4956,31 @@ async def start_miniapp_api_server(bot: Bot):
     async def api_shop_stars(request: web.Request):
         user = await resolve_webapp_user(request)
         if not user:
-            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
-        body = await request.json()
-        order_code = str(body.get("order_code") or "").strip()
-        disc_info = await get_effective_discount(user)
-        pct = disc_info["percent"]
-        order = resolve_order_details(order_code, pct)
-        if not order:
-            return web.json_response({"ok": False, "error": "Товар не найден"}, status=400)
-        desc = (
-            f"Безлимитный доступ ко всем PRO-моделям на {order['value']} дн."
-            if order["type"] == "sub"
-            else f"Пакет на {order['value']} дополнительных запросов."
-        )
-        inv_url = await bot.create_invoice_link(
-            title=order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else ""),
-            description=desc,
-            payload=f"ord:{order_code}",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice(label=order["title"], amount=order["stars"])],
-        )
-        return web.json_response({"ok": True, "invoice_url": inv_url})
+            return web.json_response({"ok": False, "error": "Открой Mini App внутри Telegram"}, status=401)
+        try:
+            body = await request.json()
+            order_code = str(body.get("order_code") or "").strip()
+            disc_info = await get_effective_discount(user)
+            pct = disc_info["percent"]
+            order = resolve_order_details(order_code, pct)
+            if not order:
+                return web.json_response({"ok": False, "error": "Товар не найден"}, status=400)
+            desc = (
+                f"Безлимитный доступ ко всем моделям на {order['value']} дн."
+                if order["type"] == "sub"
+                else f"Пакет на {order['value']} дополнительных запросов."
+            )
+            inv_url = await bot.create_invoice_link(
+                title=order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else ""),
+                description=desc,
+                payload=f"ord:{order_code}",
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=order["title"], amount=order["stars"])],
+            )
+            return web.json_response({"ok": True, "invoice_url": inv_url})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
 
     async def api_withdraw(request: web.Request):
         user = await resolve_webapp_user(request)
