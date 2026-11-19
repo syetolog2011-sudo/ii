@@ -14,6 +14,11 @@ import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command
+import hashlib
+import hmac
+import json
+from urllib.parse import parse_qsl
+from aiohttp import web
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -23,6 +28,7 @@ from aiogram.types import (
     PreCheckoutQuery,
     BotCommand,
     FSInputFile,
+    WebAppInfo,
 )
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -49,6 +55,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "1991878700"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@AetherNeural")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https" + "://" + "t.me/AetherNeural")
 BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "https://t.me/AetherNeural_bot").strip()
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
+WEBAPP_PORT = int(os.getenv("PORT", os.getenv("WEBAPP_PORT", "8080")))
 
 # Документы и поддержка
 TERMS_URL = os.getenv("TERMS_URL", "https://telegra.ph/Polzovatelskoe-soglashenie-Oferta-11-15").strip()
@@ -1186,6 +1194,8 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📄 Документы и поддержка", callback_data="docs"),
         ],
     ]
+    if WEBAPP_URL:
+        buttons.insert(0, [InlineKeyboardButton(text="🚀 Открыть Mini App (Bento UI)", web_app=WebAppInfo(url=WEBAPP_URL))])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
 
@@ -4710,10 +4720,394 @@ async def setup_bot_commands(bot: Bot):
     await bot.set_my_commands(commands)
 
 
+# ================= REST API ДЛЯ TELEGRAM MINI APP (VERCEL -> BOTHOST.RU) =================
+def verify_telegram_webapp_init_data(init_data: str) -> dict | None:
+    if not init_data:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = parsed.pop("hash", "")
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            return None
+        user_raw = parsed.get("user")
+        return json.loads(user_raw) if user_raw else None
+    except Exception:
+        return None
+
+
+async def resolve_webapp_user(request: web.Request) -> dict | None:
+    init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+    tg_user = verify_telegram_webapp_init_data(init_data)
+    if tg_user and tg_user.get("id"):
+        uid = int(tg_user["id"])
+        fname = f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip() or "Пользователь"
+        uname = tg_user.get("username", "") or ""
+        return await get_user(uid, full_name=fname, username=uname)
+    return None
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data, X-User-Id",
+            },
+        )
+    resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data, X-User-Id"
+    return resp
+
+
+async def start_miniapp_api_server(bot: Bot):
+    me = await bot.get_me()
+    bot_username = me.username or "AetherNeural_bot"
+
+    async def api_health(request: web.Request):
+        return web.json_response({"ok": True, "service": "AetherNeural MiniApp API"})
+
+    async def api_me(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Открой Mini App внутри Telegram"}, status=401)
+        uid = user["user_id"]
+        pro_active = is_pro(user) or (uid == ADMIN_ID)
+        total_daily = FREE_DAILY_LIMIT + (user.get("bonus_limit") or 0)
+        left_daily = max(0, total_daily - (user.get("used_today") or 0))
+        disc_info = await get_effective_discount(user)
+        engine = await get_engine_model()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE referred_by = ? AND ref_rewarded = 1",
+                (uid,),
+            ) as cur:
+                ref_cnt = (await cur.fetchone())[0]
+
+        return web.json_response({
+            "ok": True,
+            "user_id": uid,
+            "full_name": user.get("full_name") or "Пользователь",
+            "is_admin": uid == ADMIN_ID,
+            "is_pro": pro_active,
+            "selected_model": user.get("selected_model") or DEFAULT_ENGINE_MODEL,
+            "engine_model": engine,
+            "daily_left": left_daily,
+            "daily_total": total_daily,
+            "extra_requests": user.get("extra_requests") or 0,
+            "ref_balance": float(user.get("ref_balance") or 0.0),
+            "ref_count": ref_cnt,
+            "ref_link": f"https://t.me/{bot_username}?start={uid}",
+            "discount_percent": disc_info["percent"],
+            "discount_until": disc_info["until"],
+            "is_global_discount": disc_info["is_global"],
+        })
+
+    async def api_select_model(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        body = await request.json()
+        model_id = str(body.get("model_id") or "").strip()
+        m_info = ALL_MODELS_MAP.get(model_id)
+        if not m_info:
+            return web.json_response({"ok": False, "error": "Модель не найдена"}, status=400)
+        pro_active = is_pro(user) or (user["user_id"] == ADMIN_ID)
+        if m_info["pro"] and not pro_active:
+            return web.json_response({"ok": False, "error": "Эта модель доступна только по подписке PRO"}, status=403)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET selected_model = ? WHERE user_id = ?", (model_id, user["user_id"]))
+            await db.commit()
+        return web.json_response({"ok": True, "selected_model": model_id})
+
+    async def api_clear_history(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        await clear_history(user["user_id"])
+        return web.json_response({"ok": True})
+
+    async def api_chat(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Открой приложение внутри Telegram"}, status=401)
+        uid = user["user_id"]
+        if not await check_channel_sub(bot, uid):
+            return web.json_response({"ok": False, "error": f"Подпишись на канал {CHANNEL_USERNAME} для доступа"}, status=403)
+
+        body = await request.json()
+        user_text = str(body.get("text") or "").strip()
+        image_b64 = body.get("image_b64")
+        req_model = str(body.get("model_id") or user.get("selected_model") or DEFAULT_ENGINE_MODEL).strip()
+
+        if not user_text and not image_b64:
+            return web.json_response({"ok": False, "error": "Пустой запрос"}, status=400)
+        if is_content_forbidden(user_text):
+            return web.json_response({"ok": False, "error": "Запрос отклонён системой безопасности"}, status=400)
+
+        pro_active = is_pro(user) or (uid == ADMIN_ID)
+        if ALL_MODELS_MAP.get(req_model, {}).get("pro") and not pro_active:
+            return web.json_response({"ok": False, "error": "Срок PRO-подписки истёк"}, status=403)
+
+        quota_receipt = await try_consume_quota(uid, pro_active, count=1)
+        if not quota_receipt:
+            return web.json_response({"ok": False, "error": "Дневной лимит и пакет запросов исчерпаны"}, status=402)
+
+        engine_used = req_model if (uid == ADMIN_ID and req_model) else await get_engine_model()
+        try:
+            if image_b64:
+                answer = await generate_photos_response(uid, req_model, user_text, [image_b64])
+                log_q = f"[MiniApp Фото]: {user_text[:400]}"
+                req_tag = "📸 MiniApp Фото"
+            else:
+                history = await get_history(uid)
+                answer = await generate_text_response(uid, req_model, history, user_text)
+                log_q = user_text
+                req_tag = "💬 MiniApp Текст"
+
+            _, plain_ans = format_ai_response(answer)
+            await add_history(uid, "user", log_q)
+            await add_history(uid, "assistant", answer)
+            await log_user_request(uid, req_tag, log_q, answer, model_used=engine_used)
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (uid,))
+                await db.commit()
+
+            fresh = await get_user(uid)
+            tot_d = FREE_DAILY_LIMIT + (fresh.get("bonus_limit") or 0)
+            left_d = max(0, tot_d - (fresh.get("used_today") or 0))
+            return web.json_response({
+                "ok": True,
+                "answer": plain_ans,
+                "engine_used": engine_used,
+                "daily_left": left_d,
+                "extra_requests": fresh.get("extra_requests") or 0,
+            })
+        except Exception as e:
+            await refund_quota(uid, quota_receipt)
+            return web.json_response({"ok": False, "error": str(e)[:220]}, status=500)
+
+    async def api_promo(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        body = await request.json()
+        code = str(body.get("code") or "").strip()
+        ok, msg = await redeem_promocode(user["user_id"], code)
+        if not ok:
+            clean_err = re.sub(r"<[^>]+>", "", msg)
+            return web.json_response({"ok": False, "error": clean_err}, status=400)
+        return web.json_response({"ok": True, "message": re.sub(r"<[^>]+>", "", msg)})
+
+    async def api_shop_sbp(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        body = await request.json()
+        order_code = str(body.get("order_code") or "").strip()
+        disc_info = await get_effective_discount(user)
+        order = resolve_order_details(order_code, disc_info["percent"])
+        if not order:
+            return web.json_response({"ok": False, "error": "Товар не найден"}, status=400)
+        try:
+            tx_data = await platega_create_transaction(
+                amount_rub=order["rub"],
+                description=f"{order['title']} (ID {user['user_id']})",
+                payload_str=f"{user['user_id']}:{order_code}",
+            )
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO platega_transactions "
+                    "(transaction_id, user_id, order_code, title, item_type, item_value, rub_amount, redirect_url, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)",
+                    (
+                        tx_data["transaction_id"],
+                        user["user_id"],
+                        order_code,
+                        order["title"],
+                        order["type"],
+                        order["value"],
+                        float(order["rub"]),
+                        tx_data["redirect"],
+                        time.time(),
+                    ),
+                )
+                await db.commit()
+            return web.json_response({"ok": True, "pay_url": tx_data["redirect"], "tx_id": tx_data["transaction_id"]})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
+
+    async def api_shop_stars(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        body = await request.json()
+        order_code = str(body.get("order_code") or "").strip()
+        disc_info = await get_effective_discount(user)
+        pct = disc_info["percent"]
+        order = resolve_order_details(order_code, pct)
+        if not order:
+            return web.json_response({"ok": False, "error": "Товар не найден"}, status=400)
+        desc = (
+            f"Безлимитный доступ ко всем PRO-моделям на {order['value']} дн."
+            if order["type"] == "sub"
+            else f"Пакет на {order['value']} дополнительных запросов."
+        )
+        inv_url = await bot.create_invoice_link(
+            title=order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else ""),
+            description=desc,
+            payload=f"ord:{order_code}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=order["title"], amount=order["stars"])],
+        )
+        return web.json_response({"ok": True, "invoice_url": inv_url})
+
+    async def api_withdraw(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        body = await request.json()
+        reqs = str(body.get("requisites") or "").strip()
+        if len(reqs) < 5:
+            return web.json_response({"ok": False, "error": "Укажи корректные реквизиты"}, status=400)
+        uid = user["user_id"]
+        async with get_user_lock(uid):
+            fresh = await get_user(uid)
+            bal = fresh.get("ref_balance") or 0.0
+            if bal < MIN_WITHDRAW_RUB:
+                return web.json_response({"ok": False, "error": f"Минимум {int(MIN_WITHDRAW_RUB)} ₽"}, status=400)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET ref_balance = 0 WHERE user_id = ?", (uid,))
+                cur = await db.execute(
+                    "INSERT INTO withdrawals (user_id, amount, requisites, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                    (uid, bal, reqs[:150], time.time()),
+                )
+                wid = cur.lastrowid
+                await db.commit()
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"💸 <b>Заявка на вывод #{wid} из Mini App!</b>\n👤 <code>{uid}</code> | 💰 <b>{bal:.2f} ₽</b>\n🏦 <code>{html.escape(reqs[:150])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return web.json_response({"ok": True, "withdrawal_id": wid})
+
+    async def api_admin_stats(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user or user["user_id"] != ADMIN_ID:
+            return web.json_response({"ok": False, "error": "Forbidden"}, status=403)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                total_users = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM users WHERE pro_until > ?", (time.time(),)) as cur:
+                pro_users = (await cur.fetchone())[0]
+            async with db.execute("SELECT COALESCE(SUM(stars), 0) FROM payments") as cur:
+                total_stars = (await cur.fetchone())[0]
+            async with db.execute("SELECT COALESCE(SUM(rub_amount), 0) FROM payments WHERE method = 'sbp'") as cur:
+                total_sbp_rub = (await cur.fetchone())[0]
+        return web.json_response({
+            "ok": True,
+            "total_users": total_users,
+            "pro_users": pro_users,
+            "total_stars": total_stars,
+            "total_sbp_rub": total_sbp_rub,
+            "engine_model": await get_engine_model(),
+            "global_discount": await get_global_discount(),
+        })
+
+    async def api_admin_set_engine(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user or user["user_id"] != ADMIN_ID:
+            return web.json_response({"ok": False, "error": "Forbidden"}, status=403)
+        body = await request.json()
+        new_engine = str(body.get("engine_model") or "").strip()
+        if not new_engine or " " in new_engine:
+            return web.json_response({"ok": False, "error": "Некорректный ID модели"}, status=400)
+        await set_engine_model(new_engine)
+        return web.json_response({"ok": True, "engine_model": new_engine})
+
+    async def api_admin_global_discount(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user or user["user_id"] != ADMIN_ID:
+            return web.json_response({"ok": False, "error": "Forbidden"}, status=403)
+        body = await request.json()
+        pct = int(body.get("percent") or 0)
+        hrs = int(body.get("hours") or 0)
+        if pct <= 0 or hrs <= 0:
+            await set_setting("global_discount_percent", "0")
+            await set_setting("global_discount_until", "0")
+        else:
+            await set_setting("global_discount_percent", str(min(95, pct)))
+            await set_setting("global_discount_until", str(time.time() + hrs * 3600))
+        return web.json_response({"ok": True, "global_discount": await get_global_discount()})
+
+    async def api_admin_logs(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user or user["user_id"] != ADMIN_ID:
+            return web.json_response({"ok": False, "error": "Forbidden"}, status=403)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT rl.*, COALESCE(u.full_name, 'Пользователь') AS full_name "
+                "FROM request_logs rl LEFT JOIN users u ON u.user_id = rl.user_id "
+                "ORDER BY rl.id DESC LIMIT 25"
+            ) as cur:
+                rows = await cur.fetchall()
+        logs = [
+            {
+                "id": r["id"],
+                "user_id": r["user_id"],
+                "full_name": r["full_name"],
+                "req_type": r["req_type"],
+                "user_query": (r["user_query"] or "")[:300],
+                "bot_reply": (r["bot_reply"] or "")[:200],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+        return web.json_response({"ok": True, "logs": logs})
+
+    app = web.Application(middlewares=[cors_middleware], client_max_size=12 * 1024 * 1024)
+    app.router.add_get("/", api_health)
+    app.router.add_get("/api/me", api_me)
+    app.router.add_post("/api/select-model", api_select_model)
+    app.router.add_post("/api/clear-history", api_clear_history)
+    app.router.add_post("/api/chat", api_chat)
+    app.router.add_post("/api/promo", api_promo)
+    app.router.add_post("/api/shop/create-sbp", api_shop_sbp)
+    app.router.add_post("/api/shop/create-stars", api_shop_stars)
+    app.router.add_post("/api/withdraw", api_withdraw)
+    app.router.add_get("/api/admin/stats", api_admin_stats)
+    app.router.add_post("/api/admin/set-engine", api_admin_set_engine)
+    app.router.add_post("/api/admin/global-discount", api_admin_global_discount)
+    app.router.add_get("/api/admin/logs", api_admin_logs)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBAPP_PORT)
+    await site.start()
+    print(f"Mini App API запущен на порту {WEBAPP_PORT}")
+
+
 async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
     await setup_bot_commands(bot)
+    await start_miniapp_api_server(bot)
     asyncio.create_task(delayed_discount_watcher(bot))
     asyncio.create_task(platega_status_watcher(bot))
     dp = Dispatcher()
