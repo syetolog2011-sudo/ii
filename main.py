@@ -1210,8 +1210,6 @@ def categories_kb(user_id: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📄 Документы и поддержка", callback_data="docs"),
         ],
     ]
-    if WEBAPP_URL:
-        buttons.insert(0, [InlineKeyboardButton(text="🚀 Открыть Mini App (Bento UI)", web_app=WebAppInfo(url=WEBAPP_URL))])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
 
@@ -4894,10 +4892,15 @@ async def start_miniapp_api_server(bot: Bot):
             ) as cur:
                 ref_cnt = (await cur.fetchone())[0]
 
+        host_hdr = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or ""
+        proto_hdr = request.headers.get("X-Forwarded-Proto") or ("https" if host_hdr and not host_hdr.startswith("localhost") else "http")
+        avatar_proxy_url = f"{proto_hdr}://{host_hdr}/api/avatar/{uid}" if host_hdr else ""
+
         return web.json_response({
             "ok": True,
             "user_id": uid,
             "full_name": user.get("full_name") or "Пользователь",
+            "photo_url": avatar_proxy_url,
             "is_admin": uid == ADMIN_ID,
             "is_pro": pro_active,
             "selected_model": user.get("selected_model") or DEFAULT_ENGINE_MODEL,
@@ -5241,7 +5244,29 @@ async def start_miniapp_api_server(bot: Bot):
         return web.json_response({"ok": True, "messages": hist})
 
     app = web.Application(middlewares=[cors_middleware], client_max_size=12 * 1024 * 1024)
+    async def api_user_avatar(request: web.Request):
+        uid_str = request.match_info.get("uid", "")
+        if not uid_str.isdigit():
+            return web.Response(status=404)
+        uid = int(uid_str)
+        try:
+            photos = await bot.get_user_profile_photos(user_id=uid, limit=1)
+            if not photos.total_count or not photos.photos:
+                return web.Response(status=404)
+            best_photo = photos.photos[0][-1]
+            f_info = await bot.get_file(best_photo.file_id)
+            bio = await bot.download_file(f_info.file_path)
+            img_bytes = bio.read()
+            return web.Response(
+                body=img_bytes,
+                content_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        except Exception:
+            return web.Response(status=404)
+
     app.router.add_get("/", api_health)
+    app.router.add_get("/api/avatar/{uid}", api_user_avatar)
     app.router.add_post("/api/auth/telegram-widget", api_auth_telegram_widget)
     app.router.add_post("/api/auth/verify-code", api_auth_verify_code)
     app.router.add_get("/api/history", api_history)
