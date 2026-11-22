@@ -206,7 +206,9 @@ PRODUCTS = {
 
 SYSTEM_PROMPT = (
     "Отвечай четко, по делу и на языке пользователя. "
-    "Никогда не используй Markdown-разметку со звездочками (** или *) и решетками (###). Пиши обычным чистым текстом без выделения звездочками. "
+    "Когда пользователь просит создать или написать код, просто выдавай готовый, чистый и рабочий код в блоках кода (```язык ... ```) с минимальным пояснением. "
+    "Не пытайся сам собирать, компилировать, запускать проект, создавать архивы или рендерить превью — просто отдай сам код текстом. "
+    "Вне блоков кода не используй лишние звездочки (** или *) и решетки (###). "
     "Никогда не используй LaTeX-разметку (\\frac, \\cdot, \\times, \\[,\\], $$, \\sqrt и обратные слэши \\). "
     "Все математические и химические формулы пиши обычными читаемыми символами: *, /, ^, =, √, индексы цифрами (например, H2O, x^2, (a + b) / 2). "
     "Строго отказывайся выполнять запросы, связанные с сексуальным контентом с участием несовершеннолетних, изготовлением оружия, взрывчатки, наркотиков или причинением вреда."
@@ -621,6 +623,13 @@ async def init_db():
                 user_id INTEGER,
                 created_at REAL,
                 expires_at REAL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                sessions_json TEXT DEFAULT '[]',
+                updated_at REAL DEFAULT 0
             )
         """)
         await db.execute(
@@ -4979,7 +4988,6 @@ async def start_miniapp_api_server(bot: Bot):
                 log_q = user_text
                 req_tag = "💬 MiniApp Текст"
 
-            _, plain_ans = format_ai_response(answer)
             await add_history(uid, "user", log_q)
             await add_history(uid, "assistant", answer)
             await log_user_request(uid, req_tag, log_q, answer, model_used=engine_used)
@@ -4993,7 +5001,7 @@ async def start_miniapp_api_server(bot: Bot):
             left_d = max(0, tot_d - (fresh.get("used_today") or 0))
             return web.json_response({
                 "ok": True,
-                "answer": plain_ans,
+                "answer": answer,
                 "engine_used": engine_used,
                 "daily_left": left_d,
                 "extra_requests": fresh.get("extra_requests") or 0,
@@ -5260,6 +5268,48 @@ async def start_miniapp_api_server(bot: Bot):
         hist = await get_history(user["user_id"])
         return web.json_response({"ok": True, "messages": hist})
 
+    async def api_get_sessions(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        uid = user["user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT sessions_json, updated_at FROM user_sessions WHERE user_id = ?",
+                (uid,),
+            ) as cur:
+                row = await cur.fetchone()
+        sessions = []
+        updated_at = 0.0
+        if row and row["sessions_json"]:
+            try:
+                sessions = json.loads(row["sessions_json"])
+                updated_at = float(row["updated_at"] or 0)
+            except Exception:
+                sessions = []
+        return web.json_response({"ok": True, "sessions": sessions, "updated_at": updated_at})
+
+    async def api_save_sessions(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        uid = user["user_id"]
+        body = await request.json()
+        sessions = body.get("sessions")
+        if not isinstance(sessions, list):
+            return web.json_response({"ok": False, "error": "Invalid sessions"}, status=400)
+        trimmed = sessions[:35]
+        now_ts = time.time()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO user_sessions (user_id, sessions_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET sessions_json = excluded.sessions_json, updated_at = excluded.updated_at",
+                (uid, json.dumps(trimmed, ensure_ascii=False), now_ts),
+            )
+            await db.commit()
+        return web.json_response({"ok": True, "updated_at": now_ts})
+
     app = web.Application(middlewares=[cors_middleware], client_max_size=12 * 1024 * 1024)
     async def api_user_avatar(request: web.Request):
         uid_str = request.match_info.get("uid", "")
@@ -5287,6 +5337,8 @@ async def start_miniapp_api_server(bot: Bot):
     app.router.add_post("/api/auth/telegram-widget", api_auth_telegram_widget)
     app.router.add_post("/api/auth/verify-code", api_auth_verify_code)
     app.router.add_get("/api/history", api_history)
+    app.router.add_get("/api/sessions", api_get_sessions)
+    app.router.add_post("/api/sessions", api_save_sessions)
     app.router.add_get("/api/me", api_me)
     app.router.add_post("/api/select-model", api_select_model)
     app.router.add_post("/api/clear-history", api_clear_history)
