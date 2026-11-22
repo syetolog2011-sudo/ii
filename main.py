@@ -4,6 +4,7 @@ import html
 import io
 import os
 import random
+import secrets
 import re
 import shutil
 import string
@@ -602,6 +603,21 @@ async def init_db():
                 user_id INTEGER,
                 code TEXT,
                 PRIMARY KEY (user_id, code)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS web_auth_codes (
+                code TEXT PRIMARY KEY,
+                user_id INTEGER,
+                expires_at REAL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER,
+                created_at REAL,
+                expires_at REAL
             )
         """)
         await db.execute(
@@ -4002,11 +4018,31 @@ async def cmd_delpro(message: Message, bot: Bot):
 
 
 # ================= ХЭНДЛЕРЫ НАВИГАЦИИ =================
+async def issue_web_auth_credentials(user_id: int) -> tuple[str, str]:
+    """Создаёт одноразовый код (на 10 минут) и токен веб-сессии (на 30 дней) для безопасного входа в браузере."""
+    now = time.time()
+    code = "AE-" + "".join(random.choices(string.digits, k=6))
+    token = secrets.token_urlsafe(32)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM web_auth_codes WHERE user_id = ? OR expires_at < ?", (user_id, now))
+        await db.execute(
+            "INSERT INTO web_auth_codes (code, user_id, expires_at) VALUES (?, ?, ?)",
+            (code, user_id, now + 600),
+        )
+        await db.execute(
+            "INSERT INTO web_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, user_id, now, now + 30 * 86400),
+        )
+        await db.commit()
+    return code, token
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
     USER_INPUT_STATE.pop(message.from_user.id, None)
     args = message.text.split()
-    ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
+    start_param = args[1].strip() if len(args) > 1 else ""
+    ref_id = int(start_param) if start_param.isdigit() else 0
     user = await get_user(
         message.from_user.id,
         ref_id,
@@ -4015,6 +4051,25 @@ async def cmd_start(message: Message, bot: Bot):
     )
 
     if not await ensure_subscribed(bot, message.from_user.id, message):
+        return
+
+    if start_param == "web_auth":
+        code, token = await issue_web_auth_credentials(message.from_user.id)
+        buttons = []
+        if WEBAPP_URL:
+            sep = "&" if "?" in WEBAPP_URL else "?"
+            magic_url = f"{WEBAPP_URL}{sep}token={token}&uid={message.from_user.id}"
+            buttons.append([InlineKeyboardButton(text="🌐 Войти в веб-версию в 1 клик", url=magic_url)])
+        buttons.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_cats")])
+        await message.answer(
+            f"🔐 <b>Авторизация в веб-версии Aether AI</b>\n\n"
+            f"Твой одноразовый код для входа в браузере (действует 10 минут):\n"
+            f"👉 <code>{code}</code>\n\n"
+            f"Скопируй код и вставь его на странице входа в браузере"
+            + (" или нажми кнопку ниже для мгновенного входа:" if WEBAPP_URL else "."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     cur_model_name = ALL_MODELS_MAP.get(user["selected_model"], {}).get("name", user["selected_model"])
@@ -4745,7 +4800,32 @@ def verify_telegram_webapp_init_data(init_data: str) -> dict | None:
         return None
 
 
+def verify_telegram_login_widget_data(auth_data: dict) -> bool:
+    """Проверяет криптографическую подпись официального Telegram Login Widget."""
+    if not isinstance(auth_data, dict):
+        return False
+    received_hash = str(auth_data.get("hash") or "").strip()
+    if not received_hash:
+        return False
+    try:
+        auth_date = int(auth_data.get("auth_date") or 0)
+        if abs(time.time() - auth_date) > 86400:
+            return False
+        check_items = []
+        for k, v in sorted(auth_data.items()):
+            if k == "hash" or v is None or v == "":
+                continue
+            check_items.append(f"{k}={v}")
+        data_check_string = "\n".join(check_items)
+        secret_key = hashlib.sha256(BOT_TOKEN.encode("utf-8")).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(calculated_hash, received_hash)
+    except Exception:
+        return False
+
+
 async def resolve_webapp_user(request: web.Request) -> dict | None:
+    # 1. Вход из Telegram Mini App (initData)
     init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
     tg_user = verify_telegram_webapp_init_data(init_data)
     if tg_user and tg_user.get("id"):
@@ -4753,6 +4833,21 @@ async def resolve_webapp_user(request: web.Request) -> dict | None:
         fname = f"{tg_user.get('first_name', '')} {tg_user.get('last_name', '')}".strip() or "Пользователь"
         uname = tg_user.get("username", "") or ""
         return await get_user(uid, full_name=fname, username=uname)
+
+    # 2. Защищённый вход из браузера по сессионному токену (после подтверждения в Telegram)
+    web_token = request.headers.get("X-Web-Auth-Token", "").strip()
+    if web_token and len(web_token) >= 16:
+        now = time.time()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id FROM web_sessions WHERE token = ? AND expires_at > ?",
+                (web_token, now),
+            ) as cur:
+                row = await cur.fetchone()
+        if row:
+            return await get_user(int(row["user_id"]))
+
     return None
 
 
@@ -4764,13 +4859,13 @@ async def cors_middleware(request: web.Request, handler):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data, X-User-Id",
+                "Access-Control-Allow-Headers": "Content-Type, X-Telegram-Init-Data, X-Web-Auth-Token, X-User-Id",
             },
         )
     resp = await handler(request)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data, X-User-Id"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data, X-Web-Auth-Token, X-User-Id"
     return resp
 
 
@@ -5089,8 +5184,67 @@ async def start_miniapp_api_server(bot: Bot):
         ]
         return web.json_response({"ok": True, "logs": logs})
 
+    async def api_auth_telegram_widget(request: web.Request):
+        body = await request.json()
+        if not verify_telegram_login_widget_data(body):
+            return web.json_response({"ok": False, "error": "Неверная подпись Telegram Login Widget"}, status=401)
+        uid = int(body["id"])
+        fname = f"{body.get('first_name', '')} {body.get('last_name', '')}".strip() or body.get("username") or "Пользователь"
+        uname = body.get("username", "") or ""
+        await get_user(uid, full_name=fname, username=uname)
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO web_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (token, uid, now, now + 30 * 86400),
+            )
+            await db.commit()
+        return web.json_response({"ok": True, "token": token, "user_id": uid, "full_name": fname})
+
+    async def api_auth_verify_code(request: web.Request):
+        body = await request.json()
+        code = str(body.get("code") or "").strip().upper()
+        if not code:
+            return web.json_response({"ok": False, "error": "Введи код из бота"}, status=400)
+        now = time.time()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id, expires_at FROM web_auth_codes WHERE code = ?",
+                (code,),
+            ) as cur:
+                row = await cur.fetchone()
+            if not row or float(row["expires_at"]) < now:
+                return web.json_response({"ok": False, "error": "Код неверный или устарел. Получи новый в боте."}, status=401)
+            uid = int(row["user_id"])
+            await db.execute("DELETE FROM web_auth_codes WHERE code = ?", (code,))
+            token = secrets.token_urlsafe(32)
+            await db.execute(
+                "INSERT INTO web_sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (token, uid, now, now + 30 * 86400),
+            )
+            await db.commit()
+        user = await get_user(uid)
+        return web.json_response({
+            "ok": True,
+            "token": token,
+            "user_id": uid,
+            "full_name": user.get("full_name") or "Пользователь",
+        })
+
+    async def api_history(request: web.Request):
+        user = await resolve_webapp_user(request)
+        if not user:
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        hist = await get_history(user["user_id"])
+        return web.json_response({"ok": True, "messages": hist})
+
     app = web.Application(middlewares=[cors_middleware], client_max_size=12 * 1024 * 1024)
     app.router.add_get("/", api_health)
+    app.router.add_post("/api/auth/telegram-widget", api_auth_telegram_widget)
+    app.router.add_post("/api/auth/verify-code", api_auth_verify_code)
+    app.router.add_get("/api/history", api_history)
     app.router.add_get("/api/me", api_me)
     app.router.add_post("/api/select-model", api_select_model)
     app.router.add_post("/api/clear-history", api_clear_history)
