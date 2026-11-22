@@ -168,6 +168,9 @@ CATEGORIES = {
             {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "pro": True, "tag": "PRO"},
             {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "pro": True, "tag": "PRO"},
             {"id": "gemini-3.1-pro", "name": "Gemini 3.1 Pro", "pro": True, "tag": "PRO"},
+            {"id": "gemini-4-argon", "name": "Gemini 4 Argon", "pro": True, "tag": "PRO"},
+            {"id": "gemini-4-carbon", "name": "Gemini 4 Carbon", "pro": True, "tag": "PRO"},
+            {"id": "gemini-4-neon", "name": "Gemini 4 Neon", "pro": True, "tag": "PRO"},
         ],
     },
     "deepseek": {
@@ -1233,8 +1236,8 @@ def models_in_category_kb(cat_key: str, current_model: str, pro_active: bool) ->
     for m in cat["models"]:
         check = "✅ " if m["id"] == current_model else ""
         if pro_active:
-            status_tag = " [РАЗБЛОКИРОВАНО]" if m["pro"] else " [FREE]"
-            lock = "🔓 " if (m["pro"] and m["id"] != current_model) else ""
+            status_tag = ""
+            lock = ""
         else:
             status_tag = f" [{m['tag']}]"
             lock = "🔒 " if m["pro"] else ""
@@ -4200,8 +4203,6 @@ async def cb_clear_chat(call: CallbackQuery):
 
 # ================= ГЕНЕРАЦИЯ (ТЕКСТ И РАЗБОР ФОТО ЧЕРЕЗ ВЫБРАННЫЙ ДВИЖОК) =================
 async def get_candidates_for_user(user_id: int, selected_model: str) -> list[str]:
-    if user_id == ADMIN_ID and selected_model:
-        return [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
     engine = await get_engine_model()
     return [engine] + [m for m in FALLBACK_MODELS if m != engine]
 
@@ -4966,7 +4967,7 @@ async def start_miniapp_api_server(bot: Bot):
         if not quota_receipt:
             return web.json_response({"ok": False, "error": "Дневной лимит и пакет запросов исчерпаны"}, status=402)
 
-        engine_used = req_model if (uid == ADMIN_ID and req_model) else await get_engine_model()
+        engine_used = await get_engine_model()
         try:
             if image_b64:
                 answer = await generate_photos_response(uid, req_model, user_text, [image_b64])
@@ -5068,15 +5069,31 @@ async def start_miniapp_api_server(bot: Bot):
                 if order["type"] == "sub"
                 else f"Пакет на {order['value']} дополнительных запросов."
             )
+            inv_title = order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else "")
+            prices = [LabeledPrice(label=order["title"], amount=order["stars"])]
             inv_url = await bot.create_invoice_link(
-                title=order["title"] + (f" (Скидка {pct}%)" if (pct > 0 and order["stars"] >= 5) else ""),
+                title=inv_title,
                 description=desc,
                 payload=f"ord:{order_code}",
                 provider_token="",
                 currency="XTR",
-                prices=[LabeledPrice(label=order["title"], amount=order["stars"])],
+                prices=prices,
             )
-            return web.json_response({"ok": True, "invoice_url": inv_url})
+            sent_to_tg = False
+            try:
+                await bot.send_invoice(
+                    chat_id=user["user_id"],
+                    title=inv_title,
+                    description=desc,
+                    payload=f"ord:{order_code}",
+                    provider_token="",
+                    currency="XTR",
+                    prices=prices,
+                )
+                sent_to_tg = True
+            except Exception:
+                sent_to_tg = False
+            return web.json_response({"ok": True, "invoice_url": inv_url, "sent_to_tg": sent_to_tg})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
 
