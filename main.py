@@ -4960,10 +4960,15 @@ async def start_miniapp_api_server(bot: Bot):
 
         body = await request.json()
         user_text = str(body.get("text") or "").strip()
-        image_b64 = body.get("image_b64")
+        images_b64 = body.get("images_b64")
+        if isinstance(images_b64, list):
+            images_b64 = [str(x) for x in images_b64 if x][:10]
+        else:
+            single_img = body.get("image_b64")
+            images_b64 = [str(single_img)] if single_img else []
         req_model = str(body.get("model_id") or user.get("selected_model") or DEFAULT_ENGINE_MODEL).strip()
 
-        if not user_text and not image_b64:
+        if not user_text and not images_b64:
             return web.json_response({"ok": False, "error": "Пустой запрос"}, status=400)
         if is_content_forbidden(user_text):
             return web.json_response({"ok": False, "error": "Запрос отклонён системой безопасности"}, status=400)
@@ -4972,16 +4977,17 @@ async def start_miniapp_api_server(bot: Bot):
         if ALL_MODELS_MAP.get(req_model, {}).get("pro") and not pro_active:
             return web.json_response({"ok": False, "error": "Срок PRO-подписки истёк"}, status=403)
 
-        quota_receipt = await try_consume_quota(uid, pro_active, count=1)
+        cost_count = max(1, len(images_b64))
+        quota_receipt = await try_consume_quota(uid, pro_active, count=cost_count)
         if not quota_receipt:
-            return web.json_response({"ok": False, "error": "Дневной лимит и пакет запросов исчерпаны"}, status=402)
+            return web.json_response({"ok": False, "error": f"Недостаточно запросов (нужно {cost_count})"}, status=402)
 
         engine_used = await get_engine_model()
         try:
-            if image_b64:
-                answer = await generate_photos_response(uid, req_model, user_text, [image_b64])
-                log_q = f"[MiniApp Фото]: {user_text[:400]}"
-                req_tag = "📸 MiniApp Фото"
+            if images_b64:
+                answer = await generate_photos_response(uid, req_model, user_text, images_b64)
+                log_q = f"[MiniApp Фото x{len(images_b64)}]: {user_text[:400]}"
+                req_tag = f"📸 MiniApp Фото ({len(images_b64)} шт.)"
             else:
                 history = await get_history(uid)
                 answer = await generate_text_response(uid, req_model, history, user_text)
