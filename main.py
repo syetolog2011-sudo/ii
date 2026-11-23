@@ -5316,7 +5316,7 @@ async def start_miniapp_api_server(bot: Bot):
             await db.commit()
         return web.json_response({"ok": True, "updated_at": now_ts})
 
-    app = web.Application(middlewares=[cors_middleware], client_max_size=12 * 1024 * 1024)
+    app = web.Application(middlewares=[cors_middleware], client_max_size=100 * 1024 * 1024)
     async def api_user_avatar(request: web.Request):
         uid_str = request.match_info.get("uid", "")
         if not uid_str.isdigit():
